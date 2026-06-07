@@ -1,0 +1,73 @@
+import asyncio
+import uvicorn
+
+from qbitdebrid.config import get_settings
+from qbitdebrid.logging import configure_logging, get_logger
+from qbitdebrid.clients.torbox import TorBoxClient
+from qbitdebrid.clients.qbit import QBitController
+from qbitdebrid.core.daemon import AutomationDaemon
+from qbitdebrid.api.proxy import ProxyServer
+
+logger = get_logger(__name__)
+
+
+async def main():
+    settings = get_settings()
+    configure_logging(settings.log_level, settings.log_format)
+
+    logger.info("starting_torqproxy", version="0.1.0")
+
+    qbit = QBitController(
+        host=settings.qbit_host,
+        port=settings.qbit_port,
+        username=settings.qbit_username,
+        password=settings.qbit_password,
+    )
+
+    if not await qbit.connect():
+        logger.error("failed_to_connect_qbittorrent")
+        return
+
+    async with TorBoxClient(settings.torbox_api_key) as torbox:
+        daemon = AutomationDaemon(
+            torbox,
+            qbit,
+            proxy_host=settings.proxy_host,
+            proxy_port=settings.proxy_port,
+            poll_interval=settings.qbit_poll_interval,
+            cache_threshold=settings.torbox_cache_threshold,
+            enable_jit_prefetch=settings.enable_jit_prefetch,
+        )
+
+        proxy = ProxyServer(settings, daemon)
+
+        daemon_task = asyncio.create_task(daemon.start())
+
+        config = uvicorn.Config(
+            proxy.app,
+            host=settings.proxy_host,
+            port=settings.proxy_port,
+            log_level=settings.log_level.lower(),
+        )
+        server = uvicorn.Server(config)
+
+        try:
+            logger.info(
+                "server_starting",
+                host=settings.proxy_host,
+                port=settings.proxy_port,
+            )
+            await server.serve()
+        except KeyboardInterrupt:
+            logger.info("shutdown_requested")
+        finally:
+            await daemon.stop()
+            daemon_task.cancel()
+            try:
+                await daemon_task
+            except asyncio.CancelledError:
+                pass
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
