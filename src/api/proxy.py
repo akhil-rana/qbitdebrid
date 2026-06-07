@@ -43,12 +43,13 @@ class ProxyServer:
 
                 range_start, range_end = self._parse_range(range_header)
 
-                cached_link = self.daemon.get_cached_link(torrent_hash)
-                if not cached_link:
-                    raise HTTPException(status_code=404, detail="Torrent not cached")
+                # Fetch the direct unzipped link dynamically based on the file_path
+                file_url = await self.daemon.torbox_client.get_direct_link(torrent_hash, file_path)
+                
+                if not file_url:
+                    raise HTTPException(status_code=404, detail="Direct file link not found on TorBox")
 
-                file_url = f"{cached_link.rstrip('/')}/{file_path}"
-
+                # Stream directly from the exact file URL, no appending needed
                 status, headers, stream = await self.streaming_service.stream_range(
                     file_url,
                     range_start,
@@ -61,8 +62,7 @@ class ProxyServer:
                     headers={
                         k: v
                         for k, v in headers.items()
-                        if k.lower()
-                        in ["content-type", "content-length", "content-range"]
+                        if k.lower() in ["content-type", "content-length", "content-range"]
                     },
                     media_type="application/octet-stream",
                 )
@@ -70,10 +70,6 @@ class ProxyServer:
             except Exception as e:
                 logger.error("proxy_error", torrent_hash=torrent_hash, error=str(e))
                 raise HTTPException(status_code=500, detail=str(e))
-
-        @self.app.get("/health")
-        async def health_check():
-            return {"status": "ok"}
 
     def _parse_range(self, range_header: str) -> tuple[int, int]:
         try:

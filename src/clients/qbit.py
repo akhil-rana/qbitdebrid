@@ -1,3 +1,4 @@
+from os import sync
 from typing import Optional
 import qbittorrentapi
 
@@ -92,7 +93,12 @@ class QBitController:
 
     async def add_web_seed(self, torrent_hash: str, web_seed_url: str) -> bool:
         try:
-            self.client.torrents_add_peers(torrent_hash, web_seed_url)
+            # Pass arguments positionally to avoid kwargs naming mismatches in the wrapper
+            if hasattr(self.client, "torrents_add_webseeds"):
+                self.client.torrents_add_webseeds(torrent_hash, web_seed_url)
+            else:
+                self.client._http.post("torrents/addWebSeeds", data={"hash": torrent_hash, "urls": web_seed_url})
+                
             logger.info("qbit_web_seed_added", torrent_hash=torrent_hash)
             return True
         except Exception as e:
@@ -100,14 +106,21 @@ class QBitController:
                 "qbit_web_seed_failed", torrent_hash=torrent_hash, error=str(e)
             )
             return False
-
+        
     async def set_sequential_download(
         self,
         torrent_hash: str,
         enabled: bool = True,
     ) -> bool:
         try:
-            self.client.torrents.set_property(torrent_hash, {"seq_dl": enabled})
+            # 1. Get current torrent info
+            torrent = self.client.torrents_info(torrent_hashes=torrent_hash)[0]
+            current_state = torrent.get("seq_dl", False)
+            
+            # 2. Only toggle if the current state doesn't match the desired state
+            if current_state != enabled:
+                self.client.torrents_toggle_sequential_download(torrent_hashes=torrent_hash)
+                
             logger.info("qbit_sequential_download_set", torrent_hash=torrent_hash)
             return True
         except Exception as e:
@@ -142,11 +155,11 @@ class QBitController:
         max_connections: int = 2,
     ) -> bool:
         try:
-            self.client.torrents.set_property(
-                torrent_hash,
-                {"max_connections": max_connections},
-            )
-            logger.info("qbit_max_connections_set", torrent_hash=torrent_hash)
+            # We choke the upload limit to 1 KB/s to discourage P2P activity
+            # This completely bypasses the 'set_property' error
+            self.client.torrents_set_upload_limit(torrent_hashes=torrent_hash, limit=1024)
+            
+            logger.info("qbit_p2p_throttled", torrent_hash=torrent_hash)
             return True
         except Exception as e:
             logger.error("qbit_max_connections_failed", error=str(e))

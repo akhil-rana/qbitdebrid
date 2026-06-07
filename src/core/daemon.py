@@ -90,6 +90,7 @@ class AutomationDaemon:
                 torrent.cache_status = CacheStatus.CACHED
                 torrent.cached_link = cache_response.download_link
                 logger.info("torrent_cached", name=torrent.name)
+                await self.torbox_client.create_torrent(torrent.info_hash)
                 await self._apply_isolation_protocol(torrent)
             else:
                 torrent.cache_status = CacheStatus.NOT_CACHED

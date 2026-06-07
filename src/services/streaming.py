@@ -62,7 +62,7 @@ class StreamingService:
                             if chunk:
                                 yield chunk
                     finally:
-                        await resp.close()
+                        resp.close()
                         await session.close()
 
                 return resp.status, response_headers, stream_body()

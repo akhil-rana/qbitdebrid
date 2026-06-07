@@ -61,8 +61,12 @@ class TorBoxClient:
             if isinstance(data, dict) and "data" in data:
                 data = data["data"]
 
-            # The endpoint returns the cached status in the data
-            cached = data.get("cached", False) if isinstance(data, dict) else False
+            # TorBox indicates a cache hit by returning the info_hash as a key in the data object
+            cached = False
+            if isinstance(data, dict):
+                # Check both lowercase and uppercase to be completely safe against formatting differences
+                cached = info_hash.lower() in data or info_hash.upper() in data
+                
             download_link = (
                 data.get("download_link") if isinstance(data, dict) else None
             )
@@ -96,59 +100,101 @@ class TorBoxClient:
             logger.error("torbox_cache_check_error", info_hash=info_hash, error=str(e))
             raise
 
-    async def get_direct_link(
-        self,
-        info_hash: str,
-        file_index: Optional[int] = None,
-    ) -> Optional[str]:
+    async def create_torrent(self, info_hash: str) -> bool:
+        """Adds the torrent to the TorBox dashboard so files can be requested."""
         if not self.client:
             raise RuntimeError("Client not initialized")
 
         try:
-            logger.info(
-                "torbox_direct_link_request",
-                info_hash=info_hash,
-                file_index=file_index,
+            logger.info("torbox_creating_torrent", info_hash=info_hash)
+            endpoint = "/api/torrents/createtorrent"
+            
+            # Form-data with a generic magnet link built from the hash
+            data = {
+                "magnet": f"magnet:?xt=urn:btih:{info_hash}",
+                "seed": "3", # TorBox standard rule
+                "allow_zip": "false" # Force unzipped behavior
+            }
+
+            response = await self.client.post(
+                endpoint,
+                data=data,
+                headers=self._get_headers(),
             )
+            response.raise_for_status()
+            
+            logger.info("torbox_torrent_created", info_hash=info_hash)
+            return True
+        except Exception as e:
+            logger.error("torbox_create_torrent_failed", info_hash=info_hash, error=str(e))
+            return False
 
-            # First, get the torrent info to get the torrent_id
-            endpoint = "/api/torrents/torrentinfo"
-            params = {"hash": info_hash}
+    async def get_direct_link(
+        self,
+        info_hash: str,
+        file_path: str,
+    ) -> Optional[str]:
+        if not self.client:
+            raise RuntimeError("Client not initialized")
 
+        # Check local cache to prevent spamming TorBox API for the same file
+        cache_key = f"{info_hash}_{file_path}"
+        if cache_key in self._link_cache:
+            link, expiry = self._link_cache[cache_key]
+            if datetime.utcnow() < expiry:
+                return link
+
+        try:
+            logger.info("torbox_direct_link_request", info_hash=info_hash, file_path=file_path)
+
+            # 1. Get your personal torrent list to find the torrent_id and file list
+            endpoint = "/api/torrents/mylist"
             response = await self.client.get(
                 endpoint,
-                params=params,
                 headers=self._get_headers(),
             )
             response.raise_for_status()
 
-            torrent_data = response.json()
-            if isinstance(torrent_data, dict) and "data" in torrent_data:
-                torrent_data = torrent_data["data"]
-
-            if (
-                not torrent_data
-                or not isinstance(torrent_data, list)
-                or len(torrent_data) == 0
-            ):
-                logger.error("torbox_torrent_not_found", info_hash=info_hash)
+            torrent_list = response.json().get("data", [])
+            if not torrent_list:
                 return None
 
-            torrent_info = torrent_data[0]
+            # 2. Find the specific torrent in your dashboard by its hash
+            torrent_info = None
+            for t in torrent_list:
+                if t.get("hash", "").lower() == info_hash.lower():
+                    torrent_info = t
+                    break
+            
+            if not torrent_info:
+                logger.error("torbox_torrent_not_in_dashboard", info_hash=info_hash)
+                return None
+
             torrent_id = torrent_info.get("id")
+            files = torrent_info.get("files", [])
 
-            if not torrent_id:
-                logger.error("torbox_no_torrent_id", info_hash=info_hash)
+            # 3. Find the exact file_id by matching the qBittorrent file_path
+            file_id = None
+            for f in files:
+                tb_name = f.get("name", "").replace("\\", "/")
+                req_name = file_path.replace("\\", "/")
+                # Substring match to handle folder structural differences
+                if tb_name in req_name or req_name in tb_name:
+                    file_id = f.get("id")
+                    break
+
+            if file_id is None:
+                logger.error("torbox_file_not_found_in_torrent", file_path=file_path)
                 return None
 
-            # Now get the download link
+            # 4. Request the direct download link (requires token in params)
             dl_endpoint = "/api/torrents/requestdl"
             dl_params = {
+                "token": self.api_key,
                 "torrent_id": torrent_id,
+                "file_id": file_id,
+                "zip_link": "false"
             }
-
-            if file_index is not None:
-                dl_params["file_id"] = file_index
 
             response = await self.client.get(
                 dl_endpoint,
@@ -157,40 +203,17 @@ class TorBoxClient:
             )
             response.raise_for_status()
 
-            dl_data = response.json()
-            if isinstance(dl_data, dict) and "data" in dl_data:
-                link = dl_data["data"]
-            else:
-                link = dl_data
-
+            link = response.json().get("data")
+            
             if link:
-                self._link_cache[info_hash] = (
-                    link,
-                    datetime.utcnow() + self._cache_ttl,
-                )
-                logger.info(
-                    "torbox_direct_link_obtained",
-                    info_hash=info_hash,
-                    file_index=file_index,
-                )
+                self._link_cache[cache_key] = (link, datetime.utcnow() + self._cache_ttl)
+                logger.info("torbox_direct_link_obtained", file_path=file_path)
 
             return link
 
-        except httpx.HTTPStatusError as e:
-            logger.error(
-                "torbox_direct_link_failed",
-                info_hash=info_hash,
-                file_index=file_index,
-                status_code=e.response.status_code,
-            )
-            raise
         except Exception as e:
-            logger.error(
-                "torbox_direct_link_error",
-                info_hash=info_hash,
-                error=str(e),
-            )
-            raise
+            logger.error("torbox_direct_link_error", info_hash=info_hash, error=str(e))
+            return None
 
     async def get_webdav_list(self, info_hash: str) -> Optional[list[dict]]:
         if not self.client:
