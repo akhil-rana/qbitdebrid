@@ -50,6 +50,12 @@ class AutomationDaemon:
             logger.info("daemon_cancelled")
         finally:
             self._running = False
+            
+            # Unban any peers we temporarily banned during this session
+            for torrent in self._known_torrents.values():
+                if torrent.banned_peers:
+                    await self.qbit_controller.unban_peers(torrent.banned_peers)
+                    
             logger.info("daemon_stopped")
 
     async def stop(self) -> None:
@@ -74,6 +80,9 @@ class AutomationDaemon:
 
             if self.enable_jit_prefetch:
                 await self._check_prefetch_opportunities(current_torrents)
+                
+            # Actively monitor and ban rogue P2P peers
+            await self._monitor_peers(current_torrents)
 
         except Exception as e:
             logger.error("poll_torrents_error", error=str(e))
@@ -84,6 +93,60 @@ class AutomationDaemon:
         try:
             # Immediately pause the torrent so it doesn't try to download prematurely
             await self.qbit_controller.pause_torrent(torrent.hash)
+
+            # Check if this is an already mutated torrent
+            if "qbitdebrid" in torrent.tags:
+                original_hash = None
+                for tag in torrent.tags.split(","):
+                    if tag.strip().startswith("original_hash:"):
+                        original_hash = tag.strip().split(":")[1]
+                        break
+                        
+                if not original_hash:
+                    logger.error("mutated_torrent_missing_original_hash", name=torrent.name)
+                    return
+                    
+                torrent.info_hash = original_hash
+                logger.info("detected_mutated_torrent", name=torrent.name, original_hash=original_hash)
+            else:
+                # This is a raw, newly added torrent. We need to mutate it to completely change its infohash
+                # This ensures the torrent is 100% private to this exact local instance and has absolutely zero P2P peers globally
+                logger.info("mutating_raw_torrent", name=torrent.name)
+                
+                torrent_data = await self.qbit_controller.export_torrent(torrent.hash)
+                if not torrent_data:
+                    return
+                    
+                import qbitdebrid.utils.bencode as bencode
+                decoded = bencode.decode(torrent_data)
+                
+                # Make it private to explicitly disable DHT/PEX/LSD
+                decoded[b"info"][b"private"] = 1
+                
+                # Add a unique source field based on the original hash to mutate the infohash completely
+                decoded[b"info"][b"source"] = f"qbitdebrid_{torrent.hash}".encode("utf-8")
+                
+                # Inject the local proxy directly into the .torrent file as an HTTP Source!
+                web_seed_url = f"http://{self.proxy_host}:{self.proxy_port}/proxy/{torrent.hash}/"
+                decoded[b"url-list"] = web_seed_url.encode("utf-8")
+                
+                encoded_data = bencode.encode(decoded)
+                
+                # We add the new torrent to qbittorrent
+                # The tags will mark it as mutated and securely store the original hash for TorBox
+                new_tags = f"qbitdebrid,original_hash:{torrent.info_hash}"
+                success = await self.qbit_controller.add_raw_torrent(
+                    encoded_data, 
+                    save_path=torrent.save_path, 
+                    tags=new_tags
+                )
+                
+                if success:
+                    # Delete the original torrent completely
+                    await self.qbit_controller.delete_torrent(torrent.hash)
+                    logger.info("raw_torrent_mutated_and_replaced", name=torrent.name)
+                    
+                return # Stop processing this one, we will catch the mutated one on the next poll
 
             cache_response = await self.torbox_client.verify_cache(
                 info_hash=torrent.info_hash
@@ -97,6 +160,10 @@ class AutomationDaemon:
                 # Add to TorBox dashboard
                 success = await self.torbox_client.create_torrent(torrent.info_hash)
                 if success:
+                    # Explicitly wait for TorBox backend database to sync the new massive game
+                    # before unleashing qBittorrent, otherwise qBittorrent probes the proxy and gets a 404.
+                    await self.torbox_client.wait_for_dashboard_sync(torrent.info_hash)
+                    
                     await self._apply_isolation_protocol(torrent)
                     # Finally resume the torrent now that everything is set up
                     await self.qbit_controller.resume_torrent(torrent.hash)
@@ -123,16 +190,6 @@ class AutomationDaemon:
         logger.info("applying_isolation_protocol", name=torrent.name)
 
         try:
-            # Provide two aliases to the same proxy to bypass qBittorrent's per-host connection limits
-            web_seed_url_1 = f"http://{self.proxy_host}:{self.proxy_port}/proxy/{torrent.hash}/"
-            web_seed_url_2 = f"http://localhost:{self.proxy_port}/proxy/{torrent.hash}/"
-            
-            torrent.web_seed_url = web_seed_url_1
-
-            # qBittorrent sometimes rejects multi-URL string formats depending on the API version.
-            # We will supply the single IPv4 alias as the primary web seed for now.
-            await self.qbit_controller.add_web_seed(torrent.hash, web_seed_url_1)
-            
             # Enable sequential downloading to force qBittorrent to pull chunks sequentially, allowing HTTP connections to stay hot and stream perfectly
             await self.qbit_controller.set_sequential_download(
                 torrent.hash, enabled=True
@@ -153,6 +210,29 @@ class AutomationDaemon:
 
         except Exception as e:
             logger.error("apply_isolation_error", name=torrent.name, error=str(e))
+
+    async def _monitor_peers(self, current_torrents: list[TorrentInfo]) -> None:
+        """Actively scans for rogue P2P peers and bans them to prioritize the web seed."""
+        for torrent in current_torrents:
+            if not torrent.isolation_applied:
+                continue
+
+            try:
+                active_peers = await self.qbit_controller.get_torrent_peers(torrent.hash)
+                rogue_peers = []
+                
+                for peer in active_peers:
+                    # Ignore the web seed itself, but ban all actual P2P peers
+                    if "127.0.0.1" not in peer and "localhost" not in peer:
+                        rogue_peers.append(peer)
+                        torrent.banned_peers.add(peer)
+
+                if rogue_peers:
+                    await self.qbit_controller.ban_peers(rogue_peers)
+                    logger.info("rogue_peers_banned", torrent_hash=torrent.hash, count=len(rogue_peers))
+                    
+            except Exception as e:
+                logger.debug("monitor_peers_error", error=str(e))
 
     async def _check_prefetch_opportunities(
         self,

@@ -24,36 +24,17 @@ class ProxyServer:
         self._setup_routes()
 
     def _setup_routes(self):
-        @self.app.api_route("/proxy/{torrent_hash}/{file_path:path}", methods=["GET", "HEAD"])
+        @self.app.api_route("/proxy/{info_hash}/{file_path:path}", methods=["GET", "HEAD"])
         async def stream_file(
-            torrent_hash: str,
+            info_hash: str,
             file_path: str,
             request: Request,
         ):
             try:
                 range_header = request.headers.get("range")
                 
-                torrent = self.daemon.get_torrent(torrent_hash)
-                if not torrent:
-                    # If the torrent isn't in our local cache yet (e.g. qBittorrent requested a file immediately on startup), fetch it directly
-                    logger.info("proxy_fetching_unknown_torrent", torrent_hash=torrent_hash)
-                    try:
-                        qbit_torrents = await self.daemon.qbit_controller.get_torrents()
-                        torrent = next((t for t in qbit_torrents if t.hash == torrent_hash), None)
-                        if torrent:
-                            self.daemon._known_torrents[torrent.hash] = torrent
-                    except Exception as e:
-                        logger.error("proxy_qbit_fetch_failed", error=str(e))
-
-                if not torrent:
-                    logger.error("proxy_torrent_not_found", torrent_hash=torrent_hash)
-                    raise HTTPException(status_code=404, detail="Torrent not found")
-
-                info_hash = torrent.info_hash
-
                 logger.info(
                     "proxy_request",
-                    torrent_hash=torrent_hash,
                     info_hash=info_hash,
                     file_path=file_path,
                     range=range_header or "bytes=0-",
@@ -68,7 +49,7 @@ class ProxyServer:
                 if file_url not in self._printed_urls:
                     from urllib.parse import quote
                     encoded_file_path = quote(file_path)
-                    proxy_url = f"http://{request.client.host if request.client else '127.0.0.1'}:{self.settings.proxy_port}/proxy/{torrent_hash}/{encoded_file_path}"
+                    proxy_url = f"http://{request.client.host if request.client else '127.0.0.1'}:{self.settings.proxy_port}/proxy/{info_hash}/{encoded_file_path}"
                     print(f"\n{'='*60}\nPROXY DOWNLOAD LINK (Paste in browser):\n{proxy_url}\n{'='*60}\n")
                     self._printed_urls.add(file_url)
                 
@@ -105,7 +86,7 @@ class ProxyServer:
             except HTTPException:
                 raise
             except Exception as e:
-                logger.error("proxy_error", torrent_hash=torrent_hash, error=str(e))
+                logger.error("proxy_error", info_hash=info_hash, error=str(e))
                 raise HTTPException(status_code=500, detail=str(e))
 
 

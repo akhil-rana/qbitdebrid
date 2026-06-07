@@ -40,6 +40,9 @@ class TorrentInfo:
     cached_link: Optional[str] = None
     isolation_applied: bool = False
     web_seed_url: Optional[str] = None
+    banned_peers: set[str] = field(default_factory=set)
+    tags: str = ""
+    save_path: str = ""
 
 
 @dataclass

@@ -1,4 +1,5 @@
 import httpx
+import asyncio
 from typing import Optional
 from datetime import datetime, timedelta
 
@@ -128,6 +129,42 @@ class TorBoxClient:
             logger.error("torbox_create_torrent_failed", info_hash=info_hash, error=str(e))
             return False
 
+    async def wait_for_dashboard_sync(self, info_hash: str) -> Optional[dict]:
+        """Polls the dashboard until the torrent appears, returning its info."""
+        if not self.client:
+            raise RuntimeError("Client not initialized")
+            
+        logger.info("torbox_waiting_for_dashboard_sync", info_hash=info_hash)
+        torrent_info = None
+        for _ in range(20):
+            try:
+                endpoint = "/api/torrents/mylist"
+                response = await self.client.get(
+                    endpoint,
+                    headers=self._get_headers(),
+                )
+                response.raise_for_status()
+
+                torrent_list = response.json().get("data", [])
+                
+                for t in torrent_list:
+                    if t.get("hash", "").lower() == info_hash.lower():
+                        torrent_info = t
+                        break
+                        
+                if torrent_info:
+                    logger.info("torbox_dashboard_synced", info_hash=info_hash)
+                    return torrent_info
+                    
+            except Exception as e:
+                logger.debug("torbox_sync_poll_error", error=str(e))
+                
+            logger.debug("torbox_torrent_not_yet_in_dashboard", info_hash=info_hash)
+            await asyncio.sleep(2.0)
+            
+        logger.error("torbox_torrent_not_in_dashboard_timeout", info_hash=info_hash)
+        return None
+
     async def get_direct_link(
         self,
         info_hash: str,
@@ -147,33 +184,22 @@ class TorBoxClient:
             logger.info("torbox_direct_link_request", info_hash=info_hash, file_path=file_path)
 
             # 1. Get your personal torrent list to find the torrent_id and file list
-            # We poll dynamically up to 15 times (30 seconds) because huge torrents take a while
-            # to appear in the dashboard API after the create_torrent command is issued.
-            torrent_info = None
-            for _ in range(15):
-                endpoint = "/api/torrents/mylist"
-                response = await self.client.get(
-                    endpoint,
-                    headers=self._get_headers(),
-                )
-                response.raise_for_status()
-
-                torrent_list = response.json().get("data", [])
-                
-                # 2. Find the specific torrent in your dashboard by its hash
-                for t in torrent_list:
-                    if t.get("hash", "").lower() == info_hash.lower():
-                        torrent_info = t
-                        break
-                        
-                if torrent_info:
-                    break
-                else:
-                    logger.debug("torbox_torrent_not_yet_in_dashboard", info_hash=info_hash)
-                    await asyncio.sleep(2.0)
+            endpoint = "/api/torrents/mylist"
+            response = await self.client.get(
+                endpoint,
+                headers=self._get_headers(),
+            )
+            response.raise_for_status()
+            torrent_list = response.json().get("data", [])
             
+            torrent_info = None
+            for t in torrent_list:
+                if t.get("hash", "").lower() == info_hash.lower():
+                    torrent_info = t
+                    break
+                    
             if not torrent_info:
-                logger.error("torbox_torrent_not_in_dashboard_timeout", info_hash=info_hash)
+                logger.error("torbox_torrent_not_in_dashboard", info_hash=info_hash)
                 return None
 
             torrent_id = torrent_info.get("id")

@@ -139,6 +139,7 @@ class StreamingService:
         timeout = httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=15.0)
         self.client = httpx.AsyncClient(limits=limits, timeout=timeout)
         self._prefetchers: Dict[str, FilePrefetcher] = {}
+        self._file_sizes: Dict[str, int] = {}
         asyncio.create_task(self._cleanup_loop())
 
     async def _cleanup_loop(self):
@@ -152,15 +153,23 @@ class StreamingService:
                     to_delete.append(url)
             for url in to_delete:
                 del self._prefetchers[url]
+                if url in self._file_sizes:
+                    del self._file_sizes[url]
                 logger.info("prefetcher_evicted", url=url)
 
     async def get_file_size(self, url: str, headers: Optional[dict[str, str]] = None) -> Optional[int]:
+        if url in self._file_sizes:
+            return self._file_sizes[url]
+            
         try:
             if headers is None:
                 headers = {}
             resp = await self.client.head(url, headers=headers, follow_redirects=True)
             size = resp.headers.get("Content-Length")
-            return int(size) if size else None
+            if size:
+                self._file_sizes[url] = int(size)
+                return int(size)
+            return None
         except Exception as e:
             logger.error("streaming_head_failed", error=str(e))
             return None
