@@ -16,6 +16,9 @@ class ProxyServer:
         self.daemon = daemon
         self.streaming_service = StreamingService(
             chunk_size=settings.proxy_chunk_size,
+            prefetch_mb=settings.proxy_prefetch_buffer_mb,
+            max_connections=settings.proxy_max_connections,
+            max_splits=settings.proxy_max_splits,
             max_retries=settings.cloudflare_retry_attempts,
             retry_backoff=settings.cloudflare_retry_backoff,
         )

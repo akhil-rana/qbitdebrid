@@ -13,6 +13,21 @@ logger = get_logger(__name__)
 
 async def main():
     settings = get_settings()
+    
+    # Print non-sensitive active environment variables
+    print("\n\033[94m====================================================\033[0m")
+    print("\033[94m           ACTIVE PROXY ENVIRONMENT CONFIG          \033[0m")
+    print("\033[94m====================================================\033[0m")
+    print(f"  -> PROXY_HOST:                 \033[92m{settings.proxy_host}\033[0m")
+    print(f"  -> PROXY_PORT:                 \033[92m{settings.proxy_port}\033[0m")
+    print(f"  -> PROXY_MAX_CONNECTIONS:      \033[92m{settings.proxy_max_connections}\033[0m")
+    print(f"  -> PROXY_MAX_SPLITS:           \033[92m{settings.proxy_max_splits}\033[0m")
+    print(f"  -> PROXY_CHUNK_SIZE:           \033[92m{settings.proxy_chunk_size} bytes ({settings.proxy_chunk_size // 1024} KB)\033[0m")
+    print(f"  -> PROXY_PREFETCH_BUFFER_MB:   \033[92m{settings.proxy_prefetch_buffer_mb} MB\033[0m")
+    print(f"  -> LOG_LEVEL:                  \033[92m{settings.log_level}\033[0m")
+    print(f"  -> ENABLE_JIT_PREFETCH:        \033[92m{settings.enable_jit_prefetch}\033[0m")
+    print("\033[94m====================================================\033[0m\n")
+
     configure_logging(settings.log_level, settings.log_format)
 
     logger.info("starting_torqproxy", version="0.1.0")

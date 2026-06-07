@@ -15,7 +15,8 @@ class Settings(BaseSettings):
 
     proxy_host: str = "127.0.0.1"
     proxy_port: int = 8888
-    proxy_max_connections: int = 1
+    proxy_max_connections: int = 16
+    proxy_max_splits: int = 16
     proxy_chunk_size: int = 4194304
     proxy_prefetch_buffer_mb: int = 512
 
@@ -35,4 +36,17 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    import os
+    settings = Settings()
+    
+    overrides = []
+    for var in ["PROXY_CHUNK_SIZE", "PROXY_MAX_CONNECTIONS", "PROXY_MAX_SPLITS", "PROXY_PREFETCH_BUFFER_MB", "PROXY_HOST", "PROXY_PORT"]:
+        if var in os.environ:
+            overrides.append(f"{var}={os.environ[var]}")
+    if overrides:
+        print(f"\n\033[93m[WARNING] Terminal environment variables are OVERRIDING your .env file:\033[0m")
+        print(f"  -> \033[91m{', '.join(overrides)}\033[0m")
+        print(f"  -> To fix and use your .env file values, run this command in your terminal:")
+        print(f"     \033[92munset {' '.join(v.split('=')[0] for v in overrides)}\033[0m\n")
+        
+    return settings

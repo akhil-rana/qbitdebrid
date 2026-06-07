@@ -24,18 +24,22 @@ class StreamingService:
         self,
         chunk_size: int = 524288,  # 512KB yielding chunks
         prefetch_mb: int = 512,
+        max_connections: int = 16,
+        max_splits: int = 16,
         max_retries: int = 3,
         retry_backoff: float = 2.0,
     ):
         self.chunk_size = chunk_size
         self.prefetch_mb = prefetch_mb
+        self.max_connections = max_connections
+        self.max_splits = max_splits
         self.max_retries = max_retries
         self.retry_backoff = retry_backoff
         
         # Max chunks in the queue dictates how far ahead we download (512MB default)
         self.max_queue_size = (self.prefetch_mb * 1024 * 1024) // self.chunk_size
         
-        limits = httpx.Limits(max_keepalive_connections=200, max_connections=400, keepalive_expiry=120.0)
+        limits = httpx.Limits(max_keepalive_connections=self.max_connections, max_connections=self.max_connections * 2, keepalive_expiry=120.0)
         timeout = httpx.Timeout(connect=10.0, read=None, write=None, pool=15.0) 
         self.client = httpx.AsyncClient(limits=limits, timeout=timeout)
         
