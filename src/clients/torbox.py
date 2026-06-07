@@ -86,7 +86,6 @@ class TorBoxClient:
             return CacheVerificationResponse(
                 cached=cached,
                 download_link=download_link,
-                zip_link=None,
             )
 
         except httpx.HTTPStatusError as e:
@@ -148,26 +147,33 @@ class TorBoxClient:
             logger.info("torbox_direct_link_request", info_hash=info_hash, file_path=file_path)
 
             # 1. Get your personal torrent list to find the torrent_id and file list
-            endpoint = "/api/torrents/mylist"
-            response = await self.client.get(
-                endpoint,
-                headers=self._get_headers(),
-            )
-            response.raise_for_status()
-
-            torrent_list = response.json().get("data", [])
-            if not torrent_list:
-                return None
-
-            # 2. Find the specific torrent in your dashboard by its hash
+            # We poll dynamically up to 15 times (30 seconds) because huge torrents take a while
+            # to appear in the dashboard API after the create_torrent command is issued.
             torrent_info = None
-            for t in torrent_list:
-                if t.get("hash", "").lower() == info_hash.lower():
-                    torrent_info = t
+            for _ in range(15):
+                endpoint = "/api/torrents/mylist"
+                response = await self.client.get(
+                    endpoint,
+                    headers=self._get_headers(),
+                )
+                response.raise_for_status()
+
+                torrent_list = response.json().get("data", [])
+                
+                # 2. Find the specific torrent in your dashboard by its hash
+                for t in torrent_list:
+                    if t.get("hash", "").lower() == info_hash.lower():
+                        torrent_info = t
+                        break
+                        
+                if torrent_info:
                     break
+                else:
+                    logger.debug("torbox_torrent_not_yet_in_dashboard", info_hash=info_hash)
+                    await asyncio.sleep(2.0)
             
             if not torrent_info:
-                logger.error("torbox_torrent_not_in_dashboard", info_hash=info_hash)
+                logger.error("torbox_torrent_not_in_dashboard_timeout", info_hash=info_hash)
                 return None
 
             torrent_id = torrent_info.get("id")
@@ -193,7 +199,6 @@ class TorBoxClient:
                 "token": self.api_key,
                 "torrent_id": torrent_id,
                 "file_id": file_id,
-                "zip_link": "false"
             }
 
             response = await self.client.get(
@@ -215,54 +220,7 @@ class TorBoxClient:
             logger.error("torbox_direct_link_error", info_hash=info_hash, error=str(e))
             return None
 
-    async def get_webdav_list(self, info_hash: str) -> Optional[list[dict]]:
-        if not self.client:
-            raise RuntimeError("Client not initialized")
 
-        try:
-            logger.info("torbox_webdav_list_request", info_hash=info_hash)
-
-            # Get torrent info which includes file list
-            endpoint = "/api/torrents/torrentinfo"
-            params = {
-                "hash": info_hash,
-            }
-
-            response = await self.client.get(
-                endpoint,
-                params=params,
-                headers=self._get_headers(),
-            )
-            response.raise_for_status()
-
-            data = response.json()
-            if isinstance(data, dict) and "data" in data:
-                data = data["data"]
-
-            if not data or not isinstance(data, list) or len(data) == 0:
-                return None
-
-            torrent_info = data[0]
-            files = torrent_info.get("files", [])
-
-            logger.info(
-                "torbox_webdav_list_obtained",
-                info_hash=info_hash,
-                file_count=len(files),
-            )
-
-            return files
-
-        except httpx.HTTPStatusError as e:
-            logger.error(
-                "torbox_webdav_list_failed",
-                info_hash=info_hash,
-                status_code=e.response.status_code,
-            )
-            raise
-        except Exception as e:
-            logger.error("torbox_webdav_list_error", info_hash=info_hash, error=str(e))
-            raise
 
     def get_cached_link(self, info_hash: str) -> Optional[str]:
         if info_hash in self._link_cache:

@@ -91,13 +91,31 @@ class QBitController:
             )
             raise
 
+    async def pause_torrent(self, torrent_hash: str) -> bool:
+        try:
+            self.client.torrents_pause(torrent_hashes=torrent_hash)
+            logger.info("qbit_torrent_paused", torrent_hash=torrent_hash)
+            return True
+        except Exception as e:
+            logger.error("qbit_pause_torrent_failed", error=str(e))
+            return False
+
+    async def resume_torrent(self, torrent_hash: str) -> bool:
+        try:
+            self.client.torrents_resume(torrent_hashes=torrent_hash)
+            logger.info("qbit_torrent_resumed", torrent_hash=torrent_hash)
+            return True
+        except Exception as e:
+            logger.error("qbit_resume_torrent_failed", error=str(e))
+            return False
+
     async def add_web_seed(self, torrent_hash: str, web_seed_url: str) -> bool:
         try:
-            # Pass arguments positionally to avoid kwargs naming mismatches in the wrapper
-            if hasattr(self.client, "torrents_add_webseeds"):
-                self.client.torrents_add_webseeds(torrent_hash, web_seed_url)
+            # Use the correct python wrapper API method
+            if hasattr(self.client.torrents, "add_webseeds"):
+                self.client.torrents.add_webseeds(torrent_hash=torrent_hash, urls=web_seed_url)
             else:
-                self.client._http.post("torrents/addWebSeeds", data={"hash": torrent_hash, "urls": web_seed_url})
+                self.client.torrents_add_webseeds(torrent_hash, web_seed_url)
                 
             logger.info("qbit_web_seed_added", torrent_hash=torrent_hash)
             return True
@@ -133,15 +151,19 @@ class QBitController:
 
             for tracker in trackers:
                 tracker_url = tracker.get("url", "")
-                if tracker_url and tracker_url not in [
-                    "** [DHT] **",
-                    "** [PEX] **",
-                    "** [LSD] **",
-                ]:
+                if tracker_url:
                     try:
                         self.client.torrents_remove_trackers(torrent_hash, tracker_url)
                     except Exception:
                         pass
+            
+            # Disable DHT, PeX, and LSD globally or per-torrent if supported to mimic an archive.org pure webseed
+            try:
+                # Try to use generic edit if supported
+                if hasattr(self.client, "torrents_edit"):
+                    self.client.torrents_edit(torrent_hash=torrent_hash, tracker_url="")
+            except Exception:
+                pass
 
             logger.info("qbit_trackers_removed", torrent_hash=torrent_hash)
             return True
@@ -152,13 +174,37 @@ class QBitController:
     async def set_max_connections(
         self,
         torrent_hash: str,
-        max_connections: int = 2,
+        max_connections: int = -1,
     ) -> bool:
         try:
+            # We explicitly set the download limit to unlimited just to make sure qbittorrent doesn't internally throttle
+            self.client.torrents_set_download_limit(torrent_hashes=torrent_hash, limit=-1)
+            
             # We choke the upload limit to 1 KB/s to discourage P2P activity
-            # This completely bypasses the 'set_property' error
             self.client.torrents_set_upload_limit(torrent_hashes=torrent_hash, limit=1024)
             
+            # We must set max connections to unlimited (-1) because web seeds consume concurrent connections. 
+            # If limited to 1, qbittorrent will NEVER download faster than 1 slow HTTP stream.
+            if hasattr(self.client, "torrents_edit"):
+                self.client.torrents_edit(torrent_hash=torrent_hash, max_connections=-1, max_uploads=0)
+            
+            # Force top priority so the client actively allocates network IO
+            try:
+                self.client.torrents_top_priority(torrent_hashes=torrent_hash)
+                self.client.torrents_set_force_start(torrent_hashes=torrent_hash, value=True)
+            except Exception:
+                pass
+                
+            # Use the correct API properties to set connection limits
+            try:
+                self.client.torrents_set_share_limits(
+                    torrent_hashes=torrent_hash, 
+                    ratio_limit=0, 
+                    seeding_time_limit=0
+                )
+            except Exception:
+                pass
+
             logger.info("qbit_p2p_throttled", torrent_hash=torrent_hash)
             return True
         except Exception as e:

@@ -16,13 +16,12 @@ class Settings(BaseSettings):
     proxy_host: str = "127.0.0.1"
     proxy_port: int = 8888
     proxy_max_connections: int = 1
-    proxy_chunk_size: int = 65536
+    proxy_chunk_size: int = 4194304
 
     log_level: str = "INFO"
     log_format: str = "json"
 
     enable_jit_prefetch: bool = True
-    enable_zip_extraction: bool = True
     cloudflare_resilience_enabled: bool = True
     cloudflare_retry_attempts: int = 3
     cloudflare_retry_backoff: float = 2.0
@@ -30,6 +29,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = False
+        extra = "ignore"
 
 
 @lru_cache

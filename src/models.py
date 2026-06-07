@@ -62,7 +62,6 @@ class CacheVerificationRequest:
 class CacheVerificationResponse:
     cached: bool
     download_link: Optional[str] = None
-    zip_link: Optional[str] = None
     file_index: Optional[int] = None
 
 
@@ -77,13 +76,7 @@ class StreamingRange:
         return self.end - self.start + 1
 
 
-@dataclass
-class ZipFileEntry:
-    filename: str
-    file_offset: int
-    compressed_size: int
-    uncompressed_size: int
-    compression_method: int
+
 
 
 @dataclass

@@ -82,6 +82,9 @@ class AutomationDaemon:
         logger.info("processing_new_torrent", name=torrent.name)
 
         try:
+            # Immediately pause the torrent so it doesn't try to download prematurely
+            await self.qbit_controller.pause_torrent(torrent.hash)
+
             cache_response = await self.torbox_client.verify_cache(
                 info_hash=torrent.info_hash
             )
@@ -90,11 +93,21 @@ class AutomationDaemon:
                 torrent.cache_status = CacheStatus.CACHED
                 torrent.cached_link = cache_response.download_link
                 logger.info("torrent_cached", name=torrent.name)
-                await self.torbox_client.create_torrent(torrent.info_hash)
-                await self._apply_isolation_protocol(torrent)
+                
+                # Add to TorBox dashboard
+                success = await self.torbox_client.create_torrent(torrent.info_hash)
+                if success:
+                    await self._apply_isolation_protocol(torrent)
+                    # Finally resume the torrent now that everything is set up
+                    await self.qbit_controller.resume_torrent(torrent.hash)
+                else:
+                    logger.error("torbox_create_torrent_failed_skipping_isolation", name=torrent.name)
+                    await self.qbit_controller.resume_torrent(torrent.hash)
             else:
                 torrent.cache_status = CacheStatus.NOT_CACHED
                 logger.info("torrent_not_cached", name=torrent.name)
+                # If not cached, maybe just resume it and let qbittorrent download normally?
+                await self.qbit_controller.resume_torrent(torrent.hash)
 
         except Exception as e:
             logger.error("process_torrent_error", name=torrent.name, error=str(e))
@@ -103,22 +116,36 @@ class AutomationDaemon:
         self._known_torrents[torrent.hash] = torrent
         self.qbit_controller.track_torrent(torrent.hash)
 
+    def get_torrent(self, torrent_hash: str) -> Optional[TorrentInfo]:
+        return self._known_torrents.get(torrent_hash)
+
     async def _apply_isolation_protocol(self, torrent: TorrentInfo) -> None:
         logger.info("applying_isolation_protocol", name=torrent.name)
 
         try:
-            web_seed_url = (
-                f"http://{self.proxy_host}:{self.proxy_port}/proxy/{torrent.hash}/"
-            )
-            torrent.web_seed_url = web_seed_url
+            # Provide two aliases to the same proxy to bypass qBittorrent's per-host connection limits
+            web_seed_url_1 = f"http://{self.proxy_host}:{self.proxy_port}/proxy/{torrent.hash}/"
+            web_seed_url_2 = f"http://localhost:{self.proxy_port}/proxy/{torrent.hash}/"
+            
+            torrent.web_seed_url = web_seed_url_1
 
-            await self.qbit_controller.add_web_seed(torrent.hash, web_seed_url)
+            # qBittorrent sometimes rejects multi-URL string formats depending on the API version.
+            # We will supply the single IPv4 alias as the primary web seed for now.
+            await self.qbit_controller.add_web_seed(torrent.hash, web_seed_url_1)
+            
+            # Enable sequential downloading to force qBittorrent to pull chunks sequentially, allowing HTTP connections to stay hot and stream perfectly
             await self.qbit_controller.set_sequential_download(
-                torrent.hash, enabled=False
+                torrent.hash, enabled=True
             )
+            
+            # Remove all trackers and disable DHT/PEX for this torrent to force pure Web Seed mode.
+            # Since we now use Force Start and Top Priority, libtorrent will no longer stall the torrent.
             await self.qbit_controller.remove_trackers(torrent.hash)
+            
+            # Libtorrent heavily limits per-connection bandwidth.
+            # We explicitly UNLIMIT connections (-1) so libtorrent can rip data from the fast memory prefetch proxy.
             await self.qbit_controller.set_max_connections(
-                torrent.hash, max_connections=1
+                torrent.hash, max_connections=-1
             )
 
             torrent.isolation_applied = True
