@@ -114,11 +114,11 @@ class AutomationDaemon:
 
             await self.qbit_controller.add_web_seed(torrent.hash, web_seed_url)
             await self.qbit_controller.set_sequential_download(
-                torrent.hash, enabled=True
+                torrent.hash, enabled=False
             )
             await self.qbit_controller.remove_trackers(torrent.hash)
             await self.qbit_controller.set_max_connections(
-                torrent.hash, max_connections=2
+                torrent.hash, max_connections=1
             )
 
             torrent.isolation_applied = True
