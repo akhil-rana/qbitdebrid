@@ -78,7 +78,7 @@ class ProxyServer:
                     headers={
                         k: v
                         for k, v in headers.items()
-                        if k.lower() in ["content-type", "content-length", "content-range"]
+                        if k.lower() in ["content-type", "content-length", "content-range", "connection", "keep-alive"]
                     },
                     media_type="application/octet-stream",
                 )

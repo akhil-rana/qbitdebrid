@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     proxy_port: int = 8888
     proxy_max_connections: int = 1
     proxy_chunk_size: int = 4194304
+    proxy_prefetch_buffer_mb: int = 512
 
     log_level: str = "INFO"
     log_format: str = "json"
