@@ -104,3 +104,12 @@ qBitdebrid operates seamlessly in the background as an automated bridge:
    * It constructs a new, mutated `.torrent` binary containing no trackers, no DHT, and a single **Web Seed URL** pointing directly to your local proxy (`http://<PROXY_HOST>:8593/proxy/<hash>/<path>`).
    * It injects this mutated torrent back into qBittorrent with the connection count strictly locked to `max_connections=1`.
 5. **Streaming Proxy Proxying:** qBittorrent begins "downloading" the file. Under the hood, it sends HTTP range requests to our local proxy. The proxy dynamically resolves the real TorBox CDN download link, prefetches 4MB chunks of the file in memory, and feeds them back to qBittorrent over a single, highly stable TCP pipe. No P2P connections are ever established locally, meaning **no VPN is required!**
+
+---
+
+##  Limitations & Disclaimer
+
+* **Unconventional Use Case:** Using qBittorrent strictly as a direct HTTP download manager is highly unconventional. We strongly prefer and encourage you to seed and actively participate in P2P networks to support the sharing community whenever possible.
+* **Flaky Web Seed Implementation:** The HTTP and Web Peer (Web Seed) implementation in `libtorrent` (which powers qBittorrent) is notoriously flaky and unreliable. It can occasionally stall or break, requiring a manual restart of the qBittorrent client to restore the stream connection.
+* **No Anonymity Guarantee:** We **do not guarantee anonymity** when running without a VPN. If you choose not to use a VPN, you should completely secure your torrent client (for example, by binding qBittorrent's network interface strictly to a local IP address) to prevent accidental leaks.
+
