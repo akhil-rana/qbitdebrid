@@ -41,7 +41,6 @@ class ProxyServer:
         ):
             try:
                 range_header = request.headers.get("range")
-                
                 logger.info(
                     "proxy_request",
                     info_hash=info_hash,
@@ -50,34 +49,34 @@ class ProxyServer:
                 )
 
                 # Fetch the direct unzipped link dynamically based on the file_path
-                file_url = await self.daemon.torbox_client.get_direct_link(info_hash, file_path)
-                
-                if not file_url:
+                file_info = await self.daemon.torbox_client.get_direct_link(info_hash, file_path)
+
+                if not file_info:
                     raise HTTPException(status_code=404, detail="Direct file link not found on TorBox")
+
+                file_url, true_file_size = file_info
 
                 if file_url not in self._printed_urls:
                     encoded_file_path = quote(file_path)
                     proxy_url = f"http://{request.client.host if request.client else '127.0.0.1'}:{self.settings.proxy_port}/proxy/{info_hash}/{encoded_file_path}"
                     print(f"\n{'='*60}\nPROXY DOWNLOAD LINK (Paste in browser):\n{proxy_url}\n{'='*60}\n")
                     self._printed_urls.add(file_url)
-                
-                file_size = None
-                
+
                 if not range_header:
                     if request.method == "HEAD":
-                        file_size = await self.streaming_service.get_file_size(file_url)
-                        if file_size is not None:
-                            return StreamingResponse(
-                                content=iter([]), 
-                                status_code=200, 
-                                headers={"Accept-Ranges": "bytes", "Content-Length": str(file_size)}
-                            )
+                        return StreamingResponse(
+                            content=iter([]), 
+                            status_code=200, 
+                            headers={"Accept-Ranges": "bytes", "Content-Length": str(true_file_size)}
+                        )
                     range_header = "bytes=0-"
 
                 # Stream directly from the exact file URL, passing the range exactly as the client requested
                 status, headers, stream = await self.streaming_service.stream_range(
                     file_url,
                     range_header,
+                    request,
+                    true_file_size,
                 )
 
                 return StreamingResponse(

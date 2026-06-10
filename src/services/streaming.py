@@ -1,7 +1,7 @@
 import aiohttp
 import asyncio
 import time
-from typing import AsyncIterator, Optional, Tuple, Dict
+from typing import AsyncIterator, Optional, Tuple, Dict, Any
 from dataclasses import dataclass
 from qbitdebrid.logging import get_logger
 
@@ -83,34 +83,14 @@ class StreamingService:
             for sid in to_delete:
                 del self._active_streams[sid]
 
-    async def get_file_size(self, url: str, headers: Optional[dict[str, str]] = None) -> Optional[int]:
-        if url in self._file_sizes:
-            return self._file_sizes[url]
-            
-        try:
-            if headers is None:
-                headers = {}
-            async with self.session.head(url, headers=headers, allow_redirects=True) as resp:
-                size = resp.headers.get("Content-Length")
-                if size:
-                    self._file_sizes[url] = int(size)
-                    return int(size)
-                return None
-        except Exception as e:
-            logger.error("streaming_head_failed", error=str(e))
-            return None
-
-    async def _prefetch_worker(self, stream_id: str, url: str, headers: dict, queue: asyncio.Queue, stream: ActiveStream):
+    async def _prefetch_worker(self, stream_id: str, url: str, headers: dict, queue: asyncio.Queue, stream: ActiveStream, file_size: int):
         """Downloads continuously from the provider and pushes chunks into the bounded memory queue."""
         logger.info("prefetch_worker_starting", stream_id=stream_id, range=headers.get("Range"))
-        
-        # 1. Fetch file size to know the absolute end boundary
-        file_size = await self.get_file_size(url)
-        if not file_size:
-            file_size = 999999999999
             
         current_offset = stream.start_byte
-        timeout = aiohttp.ClientTimeout(total=None, connect=10.0, sock_read=None)
+        # Enforce a strict 15-second read timeout. If Cloudflare stalls without closing the TCP socket,
+        # this forces a TimeoutError, instantly triggering our auto-resume loop to reconnect and fix the stall!
+        timeout = aiohttp.ClientTimeout(total=None, connect=10.0, sock_read=15.0)
         
         try:
             connector = aiohttp.TCPConnector(limit=self.max_connections)
@@ -128,18 +108,6 @@ class StreamingService:
                                 await queue.put(Exception(f"Bad status: {resp.status}"))
                                 return
 
-                            # Dynamically update the true file size from the actual GET response
-                            if file_size == 999999999999:
-                                content_range = resp.headers.get("Content-Range")
-                                if content_range and "/" in content_range:
-                                    total_size_str = content_range.split("/")[-1]
-                                    if total_size_str.isdigit():
-                                        file_size = int(total_size_str)
-                                elif current_offset == 0:
-                                    content_length = resp.headers.get("Content-Length")
-                                    if content_length and content_length.isdigit():
-                                        file_size = int(content_length)
-
                             while not resp.content.at_eof() and not self.session.closed:
                                 chunk = await resp.content.read(self.chunk_size)
                                 if chunk:
@@ -153,8 +121,7 @@ class StreamingService:
                         await asyncio.sleep(0.5)
                         continue  # Safe retry and resume
                         
-                    # If the connection closed but we have not reached the known end of the file yet, auto-resume!
-                    if current_offset < file_size and file_size != 999999999999:
+                    if current_offset < file_size:
                         logger.warning("prefetch_connection_closed_by_cdn_resuming", offset=current_offset)
                         await asyncio.sleep(0.2)
                         continue
@@ -174,6 +141,8 @@ class StreamingService:
         self,
         url: str,
         range_header: str,
+        request: Any,
+        file_size: int,
         headers: Optional[dict[str, str]] = None,
     ) -> Tuple[int, dict[str, str], AsyncIterator[bytes]]:
         if headers is None:
@@ -190,8 +159,7 @@ class StreamingService:
         except Exception:
             pass
 
-        # 2. Get file size and cap req_end to avoid Content-Length mismatch
-        file_size = await self.get_file_size(url)
+        # 2. Cap req_end to avoid Content-Length mismatch
         if file_size and req_end and req_end >= file_size:
             req_end = file_size - 1
 
@@ -223,7 +191,7 @@ class StreamingService:
                 total_requested_length=content_length
             )
             
-            worker_task = asyncio.create_task(self._prefetch_worker(stream_id, url, prefetch_headers, queue, stream))
+            worker_task = asyncio.create_task(self._prefetch_worker(stream_id, url, prefetch_headers, queue, stream, file_size))
             stream.worker_task = worker_task
             self._active_streams[stream_id] = stream
 
@@ -247,6 +215,14 @@ class StreamingService:
             
             try:
                 while True:
+                    # Explicitly check if qBittorrent slammed the socket closed before yielding
+                    if await request.is_disconnected():
+                        logger.debug("client_disconnected_aborting_stream", stream_id=stream_id)
+                        stream.worker_task.cancel()
+                        if stream_id in self._active_streams:
+                            del self._active_streams[stream_id]
+                        break
+
                     if target_bytes and bytes_sent >= target_bytes:
                         next_byte = stream.start_byte + stream.bytes_produced
                         next_stream_id = f"{url}_{next_byte}"

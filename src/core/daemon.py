@@ -157,13 +157,19 @@ class AutomationDaemon:
     async def _wait_and_mutate_task(self, torrent: TorrentInfo) -> None:
         """Background task to wait for TorBox, capture current state, and mutate seamlessly."""
         try:
-            # 1. Add to TorBox dashboard
-            success = await self.torbox_client.create_torrent(torrent.info_hash)
+            # 1. Export raw .torrent file first so we can upload it to TorBox
+            torrent_data = await self.qbit_controller.export_torrent(torrent.hash)
+            if not torrent_data:
+                logger.error("failed_to_export_torrent_for_torbox", name=torrent.name)
+                return
+                
+            # 2. Add to TorBox dashboard by uploading the raw .torrent
+            success = await self.torbox_client.create_torrent(torrent.info_hash, torrent_data)
             if not success:
                 logger.error("torbox_create_torrent_failed_aborting_mutation", name=torrent.name)
                 return
 
-            # 2. Wait for TorBox dashboard sync before mutating
+            # 3. Wait for TorBox dashboard sync before mutating
             sync_info = await self.torbox_client.wait_for_dashboard_sync(torrent.info_hash)
             if sync_info is None:
                 logger.error("dashboard_sync_timeout_will_retry_later", name=torrent.name)
@@ -172,7 +178,7 @@ class AutomationDaemon:
                 self.qbit_controller._tracked_hashes.discard(torrent.hash)
                 return
 
-            # 3. Capture current state and priorities before mutation
+            # 4. Capture current state and priorities before mutation
             current_torrents = await self.qbit_controller.get_torrents()
             latest_torrent = next((t for t in current_torrents if t.hash == torrent.hash), None)
             
@@ -190,11 +196,7 @@ class AutomationDaemon:
             files = await self.qbit_controller.get_torrent_files(latest_torrent.hash)
             prios_str = ",".join(f"{f.index}={f.priority}" for f in files if f.priority != 1)
 
-            # 4. Export and Mutate
-            torrent_data = await self.qbit_controller.export_torrent(latest_torrent.hash)
-            if not torrent_data:
-                return
-                
+            # 5. Mutate the already exported torrent_data
             decoded = bencode.decode(torrent_data)
             
             # Make it private to explicitly disable DHT/PEX/LSD
@@ -220,7 +222,7 @@ class AutomationDaemon:
             decoded[b"comment"] = comment_str.encode("utf-8")
             encoded_data = bencode.encode(decoded)
             
-            # 5. Swap torrents without modifying tags
+            # 6. Swap torrents without modifying tags
             success = await self.qbit_controller.add_raw_torrent(
                 encoded_data, 
                 save_path=latest_torrent.save_path, 
@@ -249,9 +251,9 @@ class AutomationDaemon:
             # Remove trackers to force pure Web Seed mode
             await self.qbit_controller.remove_trackers(torrent.hash)
             
-            # Unlimited connections for web seed proxy speed
+            # Limit to exactly 1 connection to force a single stable stream
             await self.qbit_controller.set_max_connections(
-                torrent.hash, max_connections=-1
+                torrent.hash, max_connections=1
             )
 
             torrent.isolation_applied = True

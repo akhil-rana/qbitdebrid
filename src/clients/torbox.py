@@ -13,7 +13,8 @@ class TorBoxClient:
         self.api_key = api_key
         self.base_url = base_url
         self.client: Optional[httpx.AsyncClient] = None
-        self._link_cache: dict[str, tuple[str, datetime]] = {}
+        self._link_cache: dict[str, tuple[str, int, datetime]] = {}
+        self._torrent_ids: dict[str, int] = {}
         self._cache_ttl = timedelta(hours=24)
 
     async def __aenter__(self):
@@ -34,24 +35,35 @@ class TorBoxClient:
             "Authorization": f"Bearer {self.api_key}",
         }
 
-    async def create_torrent(self, info_hash: str) -> Optional[int]:
+    async def create_torrent(self, info_hash: str, torrent_data: Optional[bytes] = None) -> Optional[int]:
         """Adds the torrent to the TorBox dashboard and returns its torrent_id."""
         if not self.client:
             raise RuntimeError("Client not initialized")
+            
+        if info_hash in self._torrent_ids:
+            return self._torrent_ids[info_hash]
 
         try:
             logger.info("torbox_creating_torrent", info_hash=info_hash)
             endpoint = "/api/torrents/createtorrent"
             
             data = {
-                "magnet": f"magnet:?xt=urn:btih:{info_hash}",
                 "seed": "3",
                 "allow_zip": "false"
             }
+            
+            files = None
+            if torrent_data:
+                files = {
+                    "file": ("qbitdebrid.torrent", torrent_data, "application/x-bittorrent")
+                }
+            else:
+                data["magnet"] = f"magnet:?xt=urn:btih:{info_hash}"
 
             response = await self.client.post(
                 endpoint,
                 data=data,
+                files=files,
                 headers=self._get_headers(),
             )
             response.raise_for_status()
@@ -60,6 +72,7 @@ class TorBoxClient:
             torrent_id = data.get("data", {}).get("torrent_id")
             
             if torrent_id:
+                self._torrent_ids[info_hash] = torrent_id
                 logger.info("torbox_torrent_created", info_hash=info_hash, torrent_id=torrent_id)
                 return torrent_id
             else:
@@ -77,8 +90,10 @@ class TorBoxClient:
             
         logger.info("torbox_waiting_for_dashboard_sync", info_hash=info_hash)
         
-        # Strategy: 0s, 5s, 30s, then every 10s up to 6 minutes
-        poll_delays = [0, 5, 30] + [10] * 33
+        # Strategy: 0s, 5s, 30s, then every 10s up to 1 hour
+        # 1 hour = 3600 seconds. Total wait so far: 0 + 5 + 30 = 35s.
+        # Remaining: 3565 seconds / 10s intervals = ~357 iterations.
+        poll_delays = [0, 5, 30] + [10] * 357
         
         for delay in poll_delays:
             if delay > 0:
@@ -119,25 +134,60 @@ class TorBoxClient:
         logger.error("torbox_torrent_not_in_dashboard_timeout", info_hash=info_hash)
         return None
 
+    async def sync_torrent_ids(self) -> None:
+        """Pulls the user's dashboard list once to populate the torrent_id memory cache safely."""
+        if not self.client:
+            raise RuntimeError("Client not initialized")
+            
+        try:
+            logger.debug("torbox_syncing_torrent_ids")
+            endpoint = "/api/torrents/mylist?bypass_cache=true"
+            response = await self.client.get(
+                endpoint,
+                headers=self._get_headers(),
+            )
+            response.raise_for_status()
+            
+            torrent_list = response.json().get("data", [])
+            for t in torrent_list:
+                info_hash = t.get("hash", "").lower()
+                torrent_id = t.get("id")
+                if info_hash and torrent_id:
+                    self._torrent_ids[info_hash] = torrent_id
+                    
+            logger.info("torbox_torrent_ids_synced", count=len(self._torrent_ids))
+        except Exception as e:
+            logger.error("torbox_sync_torrent_ids_failed", error=str(e))
+
     async def get_direct_link(
         self,
         info_hash: str,
         file_path: str,
-    ) -> Optional[str]:
+    ) -> Optional[Tuple[str, int]]:
         if not self.client:
             raise RuntimeError("Client not initialized")
 
         cache_key = f"{info_hash}_{file_path}"
         if cache_key in self._link_cache:
-            link, expiry = self._link_cache[cache_key]
+            link, size, expiry = self._link_cache[cache_key]
             if datetime.utcnow() < expiry:
-                return link
+                return link, size
 
         try:
             logger.info("torbox_direct_link_request", info_hash=info_hash, file_path=file_path)
 
-            # 1. Get torrent_id (Idempotent, instant, guarantees it's in our dashboard)
-            torrent_id = await self.create_torrent(info_hash)
+            # 1. Get torrent_id from memory cache
+            torrent_id = self._torrent_ids.get(info_hash)
+            
+            # If missing, safely sync the entire dashboard list to avoid 429 API spam
+            if not torrent_id:
+                await self.sync_torrent_ids()
+                torrent_id = self._torrent_ids.get(info_hash)
+                
+            # If STILL missing (extremely rare), fallback to creating it
+            if not torrent_id:
+                torrent_id = await self.create_torrent(info_hash)
+                
             if not torrent_id:
                 logger.error("torbox_direct_link_failed_to_get_torrent_id", info_hash=info_hash)
                 return None
@@ -166,13 +216,15 @@ class TorBoxClient:
 
             files = torrent_data.get("files", [])
 
-            # 3. Find the exact file_id
+            # 3. Find the exact file_id and true file size
             file_id = None
+            true_file_size = None
             for f in files:
                 tb_name = f.get("name", "").replace("\\", "/")
                 req_name = file_path.replace("\\", "/")
                 if tb_name in req_name or req_name in tb_name:
                     file_id = f.get("id")
+                    true_file_size = int(f.get("size", 0))
                     break
 
             if file_id is None:
@@ -197,10 +249,10 @@ class TorBoxClient:
             link = response.json().get("data")
             
             if link:
-                self._link_cache[cache_key] = (link, datetime.utcnow() + self._cache_ttl)
+                self._link_cache[cache_key] = (link, true_file_size, datetime.utcnow() + self._cache_ttl)
                 logger.info("torbox_direct_link_obtained", file_path=file_path)
 
-            return link
+            return link, true_file_size
 
         except Exception as e:
             logger.error("torbox_direct_link_error", info_hash=info_hash, error=str(e))

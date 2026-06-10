@@ -150,7 +150,7 @@ class QBitController:
     async def set_max_connections(
         self,
         torrent_hash: str,
-        max_connections: int = -1,
+        max_connections: int = 1,
     ) -> bool:
         try:
             # Explicitly set unlimited download limit to prevent internal throttling
@@ -159,9 +159,9 @@ class QBitController:
             # Choke upload limit to 1 KB/s to discourage P2P activity
             self.client.torrents_set_upload_limit(torrent_hashes=torrent_hash, limit=1024)
             
-            # Unlimited connections (-1) required for maximum web seed performance
+            # Limit the torrent to exactly 1 connection to force a single, stable HTTP stream from the proxy
             if hasattr(self.client, "torrents_edit"):
-                self.client.torrents_edit(torrent_hash=torrent_hash, max_connections=-1, max_uploads=0)
+                self.client.torrents_edit(torrent_hash=torrent_hash, max_connections=max_connections, max_uploads=0)
             
             # Force top priority so the client actively allocates network IO
             try:
