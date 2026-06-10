@@ -9,6 +9,11 @@ WORKDIR /build
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
+# Install system build dependencies for compilation on architectures without wheels
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gcc build-essential python3-dev && \
+    rm -rf /var/lib/apt/lists/*
+
 # Copy requirements file first to utilize Docker build layer caching
 COPY requirements.txt .
 
