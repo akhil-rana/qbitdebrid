@@ -21,11 +21,10 @@ async def main():
     print(f"  -> PROXY_HOST:                 \033[92m{settings.proxy_host}\033[0m")
     print(f"  -> PROXY_PORT:                 \033[92m{settings.proxy_port}\033[0m")
     print(f"  -> PROXY_MAX_CONNECTIONS:      \033[92m{settings.proxy_max_connections}\033[0m")
-    print(f"  -> PROXY_MAX_SPLITS:           \033[92m{settings.proxy_max_splits}\033[0m")
     print(f"  -> PROXY_CHUNK_SIZE:           \033[92m{settings.proxy_chunk_size} bytes ({settings.proxy_chunk_size // 1024} KB)\033[0m")
     print(f"  -> PROXY_PREFETCH_BUFFER_MB:   \033[92m{settings.proxy_prefetch_buffer_mb} MB\033[0m")
+    print(f"  -> TORRENT_PROCESS_TAG:        \033[92m{settings.torrent_process_tag or '(Process All)'}\033[0m")
     print(f"  -> LOG_LEVEL:                  \033[92m{settings.log_level}\033[0m")
-    print(f"  -> ENABLE_JIT_PREFETCH:        \033[92m{settings.enable_jit_prefetch}\033[0m")
     print("\033[94m====================================================\033[0m\n")
 
     configure_logging(settings.log_level, settings.log_format)
@@ -50,8 +49,7 @@ async def main():
             proxy_host=settings.proxy_host,
             proxy_port=settings.proxy_port,
             poll_interval=settings.qbit_poll_interval,
-            cache_threshold=settings.torbox_cache_threshold,
-            enable_jit_prefetch=settings.enable_jit_prefetch,
+            process_tag=settings.torrent_process_tag,
         )
 
         proxy = ProxyServer(settings, daemon)

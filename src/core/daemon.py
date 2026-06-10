@@ -1,11 +1,11 @@
 import asyncio
-from datetime import datetime, timedelta
 from typing import Optional
 
 from qbitdebrid.clients.torbox import TorBoxClient
 from qbitdebrid.clients.qbit import QBitController
-from qbitdebrid.models import TorrentInfo, CacheStatus, PrefetchTask
+from qbitdebrid.models import TorrentInfo
 from qbitdebrid.logging import get_logger
+import qbitdebrid.utils.bencode as bencode
 
 logger = get_logger(__name__)
 
@@ -18,21 +18,17 @@ class AutomationDaemon:
         proxy_host: str = "127.0.0.1",
         proxy_port: int = 8888,
         poll_interval: int = 3,
-        cache_threshold: float = 0.95,
-        enable_jit_prefetch: bool = True,
+        process_tag: str = "",
     ):
         self.torbox_client = torbox_client
         self.qbit_controller = qbit_controller
         self.proxy_host = proxy_host
         self.proxy_port = proxy_port
         self.poll_interval = poll_interval
-        self.cache_threshold = cache_threshold
-        self.enable_jit_prefetch = enable_jit_prefetch
+        self.process_tag = process_tag
 
         self._running = False
         self._known_torrents: dict[str, TorrentInfo] = {}
-        self._pending_prefetch_tasks: dict[str, PrefetchTask] = {}
-        self._last_prefetch_check: dict[str, datetime] = {}
 
     async def start(self) -> None:
         self._running = True
@@ -77,9 +73,6 @@ class AutomationDaemon:
                     )
                     if torrent:
                         await self._process_new_torrent(torrent)
-
-            if self.enable_jit_prefetch:
-                await self._check_prefetch_opportunities(current_torrents)
                 
             # Actively monitor and ban rogue P2P peers
             await self._monitor_peers(current_torrents)
@@ -88,119 +81,175 @@ class AutomationDaemon:
             logger.error("poll_torrents_error", error=str(e))
 
     async def _process_new_torrent(self, torrent: TorrentInfo) -> None:
+        # Filter by tag if configured
+        if self.process_tag:
+            # Check if this torrent is missing the required process tag
+            current_tags = [t.strip() for t in torrent.tags.split(",") if t.strip()]
+            if self.process_tag not in current_tags:
+                # Users often add a torrent and then tag it manually.
+                # Do NOT add to _known_torrents yet so we can see the tag update later.
+                logger.debug("ignoring_torrent_due_to_missing_tag", name=torrent.name, required_tag=self.process_tag)
+                return
+
         logger.info("processing_new_torrent", name=torrent.name)
 
         try:
-            # Immediately pause the torrent so it doesn't try to download prematurely
-            await self.qbit_controller.pause_torrent(torrent.hash)
-
-            # Check if this is an already mutated torrent
-            if "qbitdebrid" in torrent.tags:
+            # Check if this is an already mutated torrent by looking for our signature in the comment
+            is_mutated = torrent.comment and "qbitdebrid_original_hash:" in torrent.comment
+            
+            if is_mutated:
                 original_hash = None
-                for tag in torrent.tags.split(","):
-                    if tag.strip().startswith("original_hash:"):
-                        original_hash = tag.strip().split(":")[1]
-                        break
+                prios = {}
+                target_state = "downloading"
+                
+                # Retrieve original_hash, priorities, and state from the comment field
+                parts = torrent.comment.split("|")
+                for part in parts:
+                    if part.startswith("qbitdebrid_original_hash:"):
+                        original_hash = part.split(":")[1].strip()
+                    elif part.startswith("prios:"):
+                        prios_str = part.split("prios:")[1].strip()
+                        if prios_str:
+                            try:
+                                prios = {int(p.split("=")[0]): int(p.split("=")[1]) for p in prios_str.split(",")}
+                            except Exception as e:
+                                logger.error("failed_to_parse_priorities", error=str(e))
+                    elif part.startswith("state:"):
+                        target_state = part.split(":")[1].strip()
+                    
+                # Backward compatibility: Check tags if not in comment (for older mutated torrents)
+                if not original_hash:
+                    for tag in torrent.tags.split(","):
+                        if tag.strip().startswith("original_hash:"):
+                            original_hash = tag.strip().split(":")[1]
+                            break
                         
                 if not original_hash:
                     logger.error("mutated_torrent_missing_original_hash", name=torrent.name)
+                    # Track it so we don't endlessly spam the logs trying to process a broken torrent
+                    self._known_torrents[torrent.hash] = torrent
+                    self.qbit_controller.track_torrent(torrent.hash)
                     return
                     
                 torrent.info_hash = original_hash
                 logger.info("detected_mutated_torrent", name=torrent.name, original_hash=original_hash)
+                
+                # Restore original file selection/priorities if they were saved
+                if prios:
+                    await self.qbit_controller.set_file_priority(torrent.hash, prios)
+                    logger.info("restored_file_priorities", name=torrent.name)
+                    
+                # Apply isolation protocol (which enables sequential download and removes trackers)
+                await self._apply_isolation_protocol(torrent)
+                
             else:
-                # This is a raw, newly added torrent. We need to mutate it to completely change its infohash
-                # This ensures the torrent is 100% private to this exact local instance and has absolutely zero P2P peers globally
-                logger.info("mutating_raw_torrent", name=torrent.name)
+                # Handle raw, newly added torrent via background task to prevent blocking
+                logger.info("queuing_raw_torrent_for_background_mutation", name=torrent.name)
+                asyncio.create_task(self._wait_and_mutate_task(torrent))
                 
-                torrent_data = await self.qbit_controller.export_torrent(torrent.hash)
-                if not torrent_data:
-                    return
-                    
-                import qbitdebrid.utils.bencode as bencode
-                decoded = bencode.decode(torrent_data)
-                
-                # Make it private to explicitly disable DHT/PEX/LSD
-                decoded[b"info"][b"private"] = 1
-                
-                # Add a unique source field based on the original hash to mutate the infohash completely
-                decoded[b"info"][b"source"] = f"qbitdebrid_{torrent.hash}".encode("utf-8")
-                
-                # Inject the local proxy directly into the .torrent file as an HTTP Source!
-                web_seed_url = f"http://{self.proxy_host}:{self.proxy_port}/proxy/{torrent.hash}/"
-                decoded[b"url-list"] = web_seed_url.encode("utf-8")
-                
-                encoded_data = bencode.encode(decoded)
-                
-                # We add the new torrent to qbittorrent
-                # The tags will mark it as mutated and securely store the original hash for TorBox
-                new_tags = f"qbitdebrid,original_hash:{torrent.info_hash}"
-                success = await self.qbit_controller.add_raw_torrent(
-                    encoded_data, 
-                    save_path=torrent.save_path, 
-                    tags=new_tags
-                )
-                
-                if success:
-                    # Delete the original torrent completely
-                    await self.qbit_controller.delete_torrent(torrent.hash)
-                    logger.info("raw_torrent_mutated_and_replaced", name=torrent.name)
-                    
-                return # Stop processing this one, we will catch the mutated one on the next poll
-
-            cache_response = await self.torbox_client.verify_cache(
-                info_hash=torrent.info_hash
-            )
-
-            if cache_response.cached:
-                torrent.cache_status = CacheStatus.CACHED
-                torrent.cached_link = cache_response.download_link
-                logger.info("torrent_cached", name=torrent.name)
-                
-                # Add to TorBox dashboard
-                success = await self.torbox_client.create_torrent(torrent.info_hash)
-                if success:
-                    # Explicitly wait for TorBox backend database to sync the new massive game
-                    # before unleashing qBittorrent, otherwise qBittorrent probes the proxy and gets a 404.
-                    await self.torbox_client.wait_for_dashboard_sync(torrent.info_hash)
-                    
-                    await self._apply_isolation_protocol(torrent)
-                    # Finally resume the torrent now that everything is set up
-                    await self.qbit_controller.resume_torrent(torrent.hash)
-                else:
-                    logger.error("torbox_create_torrent_failed_skipping_isolation", name=torrent.name)
-                    await self.qbit_controller.resume_torrent(torrent.hash)
-            else:
-                torrent.cache_status = CacheStatus.NOT_CACHED
-                logger.info("torrent_not_cached", name=torrent.name)
-                # If not cached, maybe just resume it and let qbittorrent download normally?
-                await self.qbit_controller.resume_torrent(torrent.hash)
-
         except Exception as e:
             logger.error("process_torrent_error", name=torrent.name, error=str(e))
-            torrent.cache_status = CacheStatus.UNKNOWN
 
+        # Always add to known torrents so the daemon doesn't poll it again immediately
         self._known_torrents[torrent.hash] = torrent
         self.qbit_controller.track_torrent(torrent.hash)
 
-    def get_torrent(self, torrent_hash: str) -> Optional[TorrentInfo]:
-        return self._known_torrents.get(torrent_hash)
+    async def _wait_and_mutate_task(self, torrent: TorrentInfo) -> None:
+        """Background task to wait for TorBox, capture current state, and mutate seamlessly."""
+        try:
+            # 1. Add to TorBox dashboard
+            success = await self.torbox_client.create_torrent(torrent.info_hash)
+            if not success:
+                logger.error("torbox_create_torrent_failed_aborting_mutation", name=torrent.name)
+                return
+
+            # 2. Wait for TorBox dashboard sync before mutating
+            sync_info = await self.torbox_client.wait_for_dashboard_sync(torrent.info_hash)
+            if sync_info is None:
+                logger.error("dashboard_sync_timeout_will_retry_later", name=torrent.name)
+                # Remove from known_torrents so the daemon natively retries processing this on the next cycle
+                self._known_torrents.pop(torrent.hash, None)
+                self.qbit_controller._tracked_hashes.discard(torrent.hash)
+                return
+
+            # 3. Capture current state and priorities before mutation
+            current_torrents = await self.qbit_controller.get_torrents()
+            latest_torrent = next((t for t in current_torrents if t.hash == torrent.hash), None)
+            
+            if not latest_torrent:
+                logger.warning("torrent_deleted_while_waiting_for_torbox", name=torrent.name)
+                return
+                
+            # Fetch the raw torrent data again to get the exact unparsed state string
+            raw_torrents = self.qbit_controller.client.torrents_info(torrent_hashes=latest_torrent.hash)
+            raw_state = raw_torrents[0].get("state", "").lower() if raw_torrents else ""
+            
+            was_paused = "pause" in raw_state or "stop" in raw_state
+            is_checking = "check" in raw_state
+            
+            files = await self.qbit_controller.get_torrent_files(latest_torrent.hash)
+            prios_str = ",".join(f"{f.index}={f.priority}" for f in files if f.priority != 1)
+
+            # 4. Export and Mutate
+            torrent_data = await self.qbit_controller.export_torrent(latest_torrent.hash)
+            if not torrent_data:
+                return
+                
+            decoded = bencode.decode(torrent_data)
+            
+            # Make it private to explicitly disable DHT/PEX/LSD
+            decoded[b"info"][b"private"] = 1
+            decoded[b"info"][b"source"] = f"qbitdebrid_{latest_torrent.hash}".encode("utf-8")
+            web_seed_url = f"http://{self.proxy_host}:{self.proxy_port}/proxy/{latest_torrent.hash}/"
+            decoded[b"url-list"] = web_seed_url.encode("utf-8")
+            
+            # Store the original hash, priorities, and play/pause state securely in the torrent comment
+            comment_str = f"qbitdebrid_original_hash:{latest_torrent.info_hash}"
+            if prios_str:
+                comment_str += f"|prios:{prios_str}"
+                
+            if was_paused:
+                state_str = "paused"
+            elif is_checking:
+                state_str = "checking"
+            else:
+                state_str = "downloading"
+                
+            comment_str += f"|state:{state_str}"
+            
+            decoded[b"comment"] = comment_str.encode("utf-8")
+            encoded_data = bencode.encode(decoded)
+            
+            # 5. Swap torrents without modifying tags
+            success = await self.qbit_controller.add_raw_torrent(
+                encoded_data, 
+                save_path=latest_torrent.save_path, 
+                tags=latest_torrent.tags,
+                is_paused=False,
+                stop_condition="FilesChecked" if was_paused else None
+            )
+            
+            if success:
+                # Only delete the original torrent after successfully adding the TorBox mirror!
+                await self.qbit_controller.delete_torrent(latest_torrent.hash)
+                logger.info("raw_torrent_mutated_and_replaced", name=latest_torrent.name)
+                
+        except Exception as e:
+            logger.error("background_mutate_error", name=torrent.name, error=str(e))
 
     async def _apply_isolation_protocol(self, torrent: TorrentInfo) -> None:
         logger.info("applying_isolation_protocol", name=torrent.name)
 
         try:
-            # Enable sequential downloading to force qBittorrent to pull chunks sequentially, allowing HTTP connections to stay hot and stream perfectly
+            # Enforce sequential download for HTTP stream optimization
             await self.qbit_controller.set_sequential_download(
                 torrent.hash, enabled=True
             )
             
-            # Remove all trackers and disable DHT/PEX for this torrent to force pure Web Seed mode.
-            # Since we now use Force Start and Top Priority, libtorrent will no longer stall the torrent.
+            # Remove trackers to force pure Web Seed mode
             await self.qbit_controller.remove_trackers(torrent.hash)
             
-            # Libtorrent heavily limits per-connection bandwidth.
-            # We explicitly UNLIMIT connections (-1) so libtorrent can rip data from the fast memory prefetch proxy.
+            # Unlimited connections for web seed proxy speed
             await self.qbit_controller.set_max_connections(
                 torrent.hash, max_connections=-1
             )
@@ -233,84 +282,3 @@ class AutomationDaemon:
                     
             except Exception as e:
                 logger.debug("monitor_peers_error", error=str(e))
-
-    async def _check_prefetch_opportunities(
-        self,
-        current_torrents: list[TorrentInfo],
-    ) -> None:
-        try:
-            for torrent in current_torrents:
-                if torrent.cache_status != CacheStatus.CACHED:
-                    continue
-
-                last_check = self._last_prefetch_check.get(torrent.hash)
-                if last_check and datetime.utcnow() - last_check < timedelta(
-                    seconds=30
-                ):
-                    continue
-
-                self._last_prefetch_check[torrent.hash] = datetime.utcnow()
-
-                files = await self.qbit_controller.get_torrent_files(torrent.hash)
-
-                for file in files:
-                    if file.progress >= self.cache_threshold:
-                        if file.index + 1 < len(files):
-                            next_file = files[file.index + 1]
-                            await self._schedule_prefetch(
-                                torrent, next_file.index, next_file.name
-                            )
-
-        except Exception as e:
-            logger.error("check_prefetch_error", error=str(e))
-
-    async def _schedule_prefetch(
-        self,
-        torrent: TorrentInfo,
-        file_index: int,
-        file_name: str,
-    ) -> None:
-        task_key = f"{torrent.hash}:{file_index}"
-
-        if task_key in self._pending_prefetch_tasks:
-            return
-
-        logger.info(
-            "scheduling_prefetch", torrent_hash=torrent.hash, file_index=file_index
-        )
-
-        try:
-            direct_link = await self.torbox_client.get_direct_link(
-                info_hash=torrent.info_hash,
-                file_index=file_index,
-            )
-
-            if direct_link:
-                task = PrefetchTask(
-                    torrent_hash=torrent.hash,
-                    file_index=file_index,
-                    file_name=file_name,
-                    cached_link=direct_link,
-                )
-                self._pending_prefetch_tasks[task_key] = task
-                logger.info("prefetch_link_obtained", file_index=file_index)
-
-        except Exception as e:
-            logger.error("schedule_prefetch_error", file_index=file_index, error=str(e))
-
-    def get_cached_link(
-        self,
-        torrent_hash: str,
-        file_index: Optional[int] = None,
-    ) -> Optional[str]:
-        if file_index is not None:
-            task_key = f"{torrent_hash}:{file_index}"
-            task = self._pending_prefetch_tasks.get(task_key)
-            if task:
-                return task.cached_link
-
-        torrent = self._known_torrents.get(torrent_hash)
-        if torrent:
-            return self.torbox_client.get_cached_link(torrent.info_hash)
-
-        return None

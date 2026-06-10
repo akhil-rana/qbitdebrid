@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from typing import Optional
+from contextlib import asynccontextmanager
+from urllib.parse import quote
 
 from qbitdebrid.config import Settings
 from qbitdebrid.core.daemon import AutomationDaemon
@@ -18,11 +19,16 @@ class ProxyServer:
             chunk_size=settings.proxy_chunk_size,
             prefetch_mb=settings.proxy_prefetch_buffer_mb,
             max_connections=settings.proxy_max_connections,
-            max_splits=settings.proxy_max_splits,
-            max_retries=settings.cloudflare_retry_attempts,
-            retry_backoff=settings.cloudflare_retry_backoff,
         )
-        self.app = FastAPI()
+        
+        @asynccontextmanager
+        async def lifespan(app: FastAPI):
+            # Startup
+            yield
+            # Shutdown
+            await self.streaming_service.close()
+            
+        self.app = FastAPI(lifespan=lifespan)
         self._printed_urls = set()
         self._setup_routes()
 
@@ -50,7 +56,6 @@ class ProxyServer:
                     raise HTTPException(status_code=404, detail="Direct file link not found on TorBox")
 
                 if file_url not in self._printed_urls:
-                    from urllib.parse import quote
                     encoded_file_path = quote(file_path)
                     proxy_url = f"http://{request.client.host if request.client else '127.0.0.1'}:{self.settings.proxy_port}/proxy/{info_hash}/{encoded_file_path}"
                     print(f"\n{'='*60}\nPROXY DOWNLOAD LINK (Paste in browser):\n{proxy_url}\n{'='*60}\n")

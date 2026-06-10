@@ -1,4 +1,4 @@
-import httpx
+import aiohttp
 import asyncio
 import time
 from typing import AsyncIterator, Optional, Tuple, Dict
@@ -18,35 +18,58 @@ class ActiveStream:
     last_accessed: float = 0.0
     bytes_produced: int = 0
     total_requested_length: Optional[int] = None
+    excess_bytes: bytes = b""
+    is_reading: bool = False
+
 
 class StreamingService:
     def __init__(
         self,
-        chunk_size: int = 524288,  # 512KB yielding chunks
+        chunk_size: int = 524288,
         prefetch_mb: int = 512,
         max_connections: int = 16,
-        max_splits: int = 16,
-        max_retries: int = 3,
-        retry_backoff: float = 2.0,
     ):
         self.chunk_size = chunk_size
         self.prefetch_mb = prefetch_mb
         self.max_connections = max_connections
-        self.max_splits = max_splits
-        self.max_retries = max_retries
-        self.retry_backoff = retry_backoff
         
-        # Max chunks in the queue dictates how far ahead we download (512MB default)
-        self.max_queue_size = (self.prefetch_mb * 1024 * 1024) // self.chunk_size
+        connector = aiohttp.TCPConnector(
+            limit=200, 
+            ttl_dns_cache=300, 
+            use_dns_cache=True,
+            force_close=False,
+            enable_cleanup_closed=True
+        )
         
-        limits = httpx.Limits(max_keepalive_connections=self.max_connections, max_connections=self.max_connections * 2, keepalive_expiry=120.0)
-        timeout = httpx.Timeout(connect=10.0, read=None, write=None, pool=15.0) 
-        self.client = httpx.AsyncClient(limits=limits, timeout=timeout)
+        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        self.session = aiohttp.ClientSession(
+            connector=connector,
+            headers={"User-Agent": user_agent}
+        )
         
         self._file_sizes: Dict[str, int] = {}
         self._active_streams: Dict[str, ActiveStream] = {}
         
-        asyncio.create_task(self._cleanup_loop())
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+
+    async def close(self):
+        """Explicitly cleans up background tasks and TCP connections on shutdown."""
+        if hasattr(self, "_cleanup_task"):
+            self._cleanup_task.cancel()
+            
+        tasks_to_await = []
+        for stream_id, stream in list(self._active_streams.items()):
+            if stream.worker_task and not stream.worker_task.done():
+                stream.worker_task.cancel()
+                tasks_to_await.append(stream.worker_task)
+                
+        if tasks_to_await:
+            await asyncio.gather(*tasks_to_await, return_exceptions=True)
+            
+        self._active_streams.clear()
+            
+        if hasattr(self, "session") and self.session and not self.session.closed:
+            await self.session.close()
 
     async def _cleanup_loop(self):
         while True:
@@ -67,12 +90,12 @@ class StreamingService:
         try:
             if headers is None:
                 headers = {}
-            resp = await self.client.head(url, headers=headers, follow_redirects=True)
-            size = resp.headers.get("Content-Length")
-            if size:
-                self._file_sizes[url] = int(size)
-                return int(size)
-            return None
+            async with self.session.head(url, headers=headers, allow_redirects=True) as resp:
+                size = resp.headers.get("Content-Length")
+                if size:
+                    self._file_sizes[url] = int(size)
+                    return int(size)
+                return None
         except Exception as e:
             logger.error("streaming_head_failed", error=str(e))
             return None
@@ -80,25 +103,64 @@ class StreamingService:
     async def _prefetch_worker(self, stream_id: str, url: str, headers: dict, queue: asyncio.Queue, stream: ActiveStream):
         """Downloads continuously from the provider and pushes chunks into the bounded memory queue."""
         logger.info("prefetch_worker_starting", stream_id=stream_id, range=headers.get("Range"))
-        try:
-            request = self.client.build_request("GET", url, headers=headers)
-            resp = await self.client.send(request, stream=True, follow_redirects=True)
+        
+        # 1. Fetch file size to know the absolute end boundary
+        file_size = await self.get_file_size(url)
+        if not file_size:
+            file_size = 999999999999
             
-            if resp.status_code not in (200, 206):
-                logger.error("prefetch_bad_status", status=resp.status_code)
-                await resp.aclose()
-                await queue.put(e)
-                return
-
-            try:
-                # Rip chunks as fast as possible from the socket. 
-                # If the queue fills up (512MB), await queue.put() naturally pauses the download loop.
-                async for chunk in resp.aiter_bytes(self.chunk_size):
-                    if chunk:
-                        await queue.put(chunk)
-            finally:
-                await resp.aclose()
+        current_offset = stream.start_byte
+        timeout = aiohttp.ClientTimeout(total=None, connect=10.0, sock_read=None)
+        
+        try:
+            connector = aiohttp.TCPConnector(limit=self.max_connections)
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                 
+                # Auto-Resume Connection Loop
+                while current_offset < file_size and not self.session.closed:
+                    worker_headers = headers.copy()
+                    worker_headers["Range"] = f"bytes={current_offset}-"
+                    
+                    try:
+                        async with session.get(url, headers=worker_headers, allow_redirects=True) as resp:
+                            if resp.status not in (200, 206):
+                                logger.error("prefetch_bad_status", status=resp.status)
+                                await queue.put(Exception(f"Bad status: {resp.status}"))
+                                return
+
+                            # Dynamically update the true file size from the actual GET response
+                            if file_size == 999999999999:
+                                content_range = resp.headers.get("Content-Range")
+                                if content_range and "/" in content_range:
+                                    total_size_str = content_range.split("/")[-1]
+                                    if total_size_str.isdigit():
+                                        file_size = int(total_size_str)
+                                elif current_offset == 0:
+                                    content_length = resp.headers.get("Content-Length")
+                                    if content_length and content_length.isdigit():
+                                        file_size = int(content_length)
+
+                            while not resp.content.at_eof() and not self.session.closed:
+                                chunk = await resp.content.read(self.chunk_size)
+                                if chunk:
+                                    await queue.put(chunk)
+                                    current_offset += len(chunk)
+                                else:
+                                    break
+                                    
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                        logger.warning("prefetch_connection_lost_reconnecting", offset=current_offset, error=str(e))
+                        await asyncio.sleep(0.5)
+                        continue  # Safe retry and resume
+                        
+                    # If the connection closed but we have not reached the known end of the file yet, auto-resume!
+                    if current_offset < file_size and file_size != 999999999999:
+                        logger.warning("prefetch_connection_closed_by_cdn_resuming", offset=current_offset)
+                        await asyncio.sleep(0.2)
+                        continue
+                    else:
+                        break
+                            
         except Exception as e:
             if not isinstance(e, asyncio.CancelledError):
                 logger.debug("prefetch_worker_interrupted", error=str(e))
@@ -128,37 +190,44 @@ class StreamingService:
         except Exception:
             pass
 
-        # 2. Check if we already have an active stream for this exact start byte
-        # (Since we force sequential download, qBittorrent will always ask for the next exact byte)
+        # 2. Get file size and cap req_end to avoid Content-Length mismatch
+        file_size = await self.get_file_size(url)
+        if file_size and req_end and req_end >= file_size:
+            req_end = file_size - 1
+
+        content_length = None
+        if file_size:
+            content_length = (req_end - req_start + 1) if req_end is not None else (file_size - req_start)
+
+        # 3. Check for an active stream starting at this byte
         stream_id = f"{url}_{req_start}"
         
-        if stream_id in self._active_streams:
+        if stream_id in self._active_streams and not self._active_streams[stream_id].is_reading:
             stream = self._active_streams[stream_id]
             stream.last_accessed = time.time()
+            stream.total_requested_length = content_length
             logger.info("resuming_active_stream", stream_id=stream_id)
         else:
-            # 3. Create a new prefetch worker that downloads from req_start to the end of the file.
-            # We ignore req_end for the provider request so we can prefetch the entire rest of the file into the queue.
+            # 4. Create a new prefetch worker
             prefetch_headers = headers.copy()
             prefetch_headers["Range"] = f"bytes={req_start}-"
             
-            queue = asyncio.Queue(maxsize=self.max_queue_size)
+            max_queue_chunks = max(4, (self.prefetch_mb * 1024 * 1024) // self.chunk_size)
+            
+            queue = asyncio.Queue(maxsize=max_queue_chunks)
             stream = ActiveStream(
                 url=url,
                 start_byte=req_start,
                 queue=queue,
-                worker_task=None, # Assigned below
-                total_requested_length=(req_end - req_start + 1) if req_end else None
+                worker_task=None,
+                total_requested_length=content_length
             )
             
             worker_task = asyncio.create_task(self._prefetch_worker(stream_id, url, prefetch_headers, queue, stream))
             stream.worker_task = worker_task
             self._active_streams[stream_id] = stream
 
-        # 4. Construct the fake 206 Partial Content headers for the client
-        file_size = await self.get_file_size(url)
-        content_length = (req_end - req_start + 1) if req_end else (file_size - req_start if file_size else None)
-        
+        # 5. Construct response headers
         response_headers = {
             "Accept-Ranges": "bytes",
             "Connection": "keep-alive"
@@ -166,61 +235,55 @@ class StreamingService:
         if content_length:
             response_headers["Content-Length"] = str(content_length)
         if file_size:
-            response_headers["Content-Range"] = f"bytes {req_start}-{req_end if req_end else file_size-1}/{file_size}"
+            response_headers["Content-Range"] = f"bytes {req_start}-{req_end if req_end is not None else file_size-1}/{file_size}"
         else:
-            response_headers["Content-Range"] = f"bytes {req_start}-{req_end if req_end else ''}/*"
+            response_headers["Content-Range"] = f"bytes {req_start}-{req_end if req_end is not None else ''}/*"
 
-        # 5. Build the non-blocking consumer generator
+        # 6. Build the non-blocking consumer generator
         async def stream_body() -> AsyncIterator[bytes]:
             bytes_sent = 0
             target_bytes = stream.total_requested_length
+            stream.is_reading = True
             
             try:
                 while True:
-                    # If we fulfilled the client's strict req_end chunk size, stop and cleanly hand over the active 
-                    # stream state. We calculate the NEXT byte the client will ask for, and re-register the stream 
-                    # under that new ID so the next request instantly picks up where we left off.
                     if target_bytes and bytes_sent >= target_bytes:
                         next_byte = stream.start_byte + stream.bytes_produced
                         next_stream_id = f"{url}_{next_byte}"
                         self._active_streams[next_stream_id] = stream
-                        # Remove old ID
                         if stream_id in self._active_streams:
                             del self._active_streams[stream_id]
                         logger.debug("stream_paused_and_handed_over", next_stream_id=next_stream_id)
                         break
 
-                    # Wait for data from the prefetch worker
-                    chunk = await stream.queue.get()
-                    stream.last_accessed = time.time()
+                    if stream.excess_bytes:
+                        chunk = stream.excess_bytes
+                        stream.excess_bytes = b""
+                    else:
+                        chunk = await stream.queue.get()
+                        stream.last_accessed = time.time()
                     
                     if chunk is None:
-                        break # EOF reached
+                        break
                     if isinstance(chunk, Exception):
-                        raise chunk # Bubble up provider errors
+                        raise chunk
                         
-                    # Yield data to qBittorrent immediately
-                    # Handle the edge case where the prefetcher grabbed a chunk slightly larger than the requested req_end
                     if target_bytes and (bytes_sent + len(chunk)) > target_bytes:
                         excess = (bytes_sent + len(chunk)) - target_bytes
                         valid_chunk = chunk[:-excess]
                         
-                        # We must push the excess bytes back to the front of the queue for the next request to consume!
-                        # Since asyncio.Queue doesn't have put_front, we handle it organically on the next iteration.
+                        stream.excess_bytes = chunk[-excess:]
+                        
                         yield valid_chunk
                         bytes_sent += len(valid_chunk)
                         stream.bytes_produced += len(valid_chunk)
                         
-                        # Clean hand-over
                         next_byte = stream.start_byte + stream.bytes_produced
                         next_stream_id = f"{url}_{next_byte}"
-                        
-                        # Create a custom queue just to hold the remainder temporarily
-                        # Actually, to keep it simple, we just cancel the worker if the chunk boundary doesn't align perfectly.
-                        # Since sequential downloads typically align perfectly, this edge case is rare.
-                        stream.worker_task.cancel()
+                        self._active_streams[next_stream_id] = stream
                         if stream_id in self._active_streams:
                             del self._active_streams[stream_id]
+                        logger.debug("stream_paused_and_handed_over_on_chunk_boundary", next_stream_id=next_stream_id)
                         break
                     else:
                         yield chunk
@@ -228,10 +291,11 @@ class StreamingService:
                         stream.bytes_produced += len(chunk)
                         
             except asyncio.CancelledError:
-                # Client abruptly disconnected
                 stream.worker_task.cancel()
                 if stream_id in self._active_streams:
                     del self._active_streams[stream_id]
                 raise
+            finally:
+                stream.is_reading = False
 
         return 206, response_headers, stream_body()

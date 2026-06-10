@@ -3,7 +3,6 @@ import asyncio
 from typing import Optional
 from datetime import datetime, timedelta
 
-from qbitdebrid.models import CacheVerificationResponse
 from qbitdebrid.logging import get_logger
 
 logger = get_logger(__name__)
@@ -35,73 +34,8 @@ class TorBoxClient:
             "Authorization": f"Bearer {self.api_key}",
         }
 
-    async def verify_cache(
-        self,
-        info_hash: str,
-        unhashed_id: Optional[str] = None,
-    ) -> CacheVerificationResponse:
-        if not self.client:
-            raise RuntimeError("Client not initialized")
-
-        try:
-            logger.info("torbox_cache_check", info_hash=info_hash)
-
-            endpoint = "/api/torrents/checkcached"
-            params = {"hash": info_hash, "format": "object", "list_files": "true"}
-
-            response = await self.client.get(
-                endpoint,
-                params=params,
-                headers=self._get_headers(),
-            )
-            response.raise_for_status()
-
-            data = response.json()
-
-            # Check if data contains success flag
-            if isinstance(data, dict) and "data" in data:
-                data = data["data"]
-
-            # TorBox indicates a cache hit by returning the info_hash as a key in the data object
-            cached = False
-            if isinstance(data, dict):
-                # Check both lowercase and uppercase to be completely safe against formatting differences
-                cached = info_hash.lower() in data or info_hash.upper() in data
-                
-            download_link = (
-                data.get("download_link") if isinstance(data, dict) else None
-            )
-
-            logger.info(
-                "torbox_cache_result",
-                info_hash=info_hash,
-                cached=cached,
-            )
-
-            if download_link:
-                self._link_cache[info_hash] = (
-                    download_link,
-                    datetime.utcnow() + self._cache_ttl,
-                )
-
-            return CacheVerificationResponse(
-                cached=cached,
-                download_link=download_link,
-            )
-
-        except httpx.HTTPStatusError as e:
-            logger.error(
-                "torbox_cache_check_failed",
-                info_hash=info_hash,
-                status_code=e.response.status_code,
-            )
-            raise
-        except Exception as e:
-            logger.error("torbox_cache_check_error", info_hash=info_hash, error=str(e))
-            raise
-
-    async def create_torrent(self, info_hash: str) -> bool:
-        """Adds the torrent to the TorBox dashboard so files can be requested."""
+    async def create_torrent(self, info_hash: str) -> Optional[int]:
+        """Adds the torrent to the TorBox dashboard and returns its torrent_id."""
         if not self.client:
             raise RuntimeError("Client not initialized")
 
@@ -109,11 +43,10 @@ class TorBoxClient:
             logger.info("torbox_creating_torrent", info_hash=info_hash)
             endpoint = "/api/torrents/createtorrent"
             
-            # Form-data with a generic magnet link built from the hash
             data = {
                 "magnet": f"magnet:?xt=urn:btih:{info_hash}",
-                "seed": "3", # TorBox standard rule
-                "allow_zip": "false" # Force unzipped behavior
+                "seed": "3",
+                "allow_zip": "false"
             }
 
             response = await self.client.post(
@@ -123,44 +56,65 @@ class TorBoxClient:
             )
             response.raise_for_status()
             
-            logger.info("torbox_torrent_created", info_hash=info_hash)
-            return True
+            data = response.json()
+            torrent_id = data.get("data", {}).get("torrent_id")
+            
+            if torrent_id:
+                logger.info("torbox_torrent_created", info_hash=info_hash, torrent_id=torrent_id)
+                return torrent_id
+            else:
+                logger.error("torbox_create_torrent_missing_id", info_hash=info_hash, response=data)
+                return None
+                
         except Exception as e:
             logger.error("torbox_create_torrent_failed", info_hash=info_hash, error=str(e))
-            return False
+            return None
 
     async def wait_for_dashboard_sync(self, info_hash: str) -> Optional[dict]:
-        """Polls the dashboard until the torrent appears, returning its info."""
+        """Polls the checkcached API to see when the torrent finishes downloading globally."""
         if not self.client:
             raise RuntimeError("Client not initialized")
             
         logger.info("torbox_waiting_for_dashboard_sync", info_hash=info_hash)
-        torrent_info = None
-        for _ in range(20):
+        
+        # Strategy: 0s, 5s, 30s, then every 10s up to 6 minutes
+        poll_delays = [0, 5, 30] + [10] * 33
+        
+        for delay in poll_delays:
+            if delay > 0:
+                await asyncio.sleep(delay)
+                
             try:
-                endpoint = "/api/torrents/mylist"
+                endpoint = "/api/torrents/checkcached"
+                params = {"hash": info_hash, "format": "object", "bypass_cache": "true"}
                 response = await self.client.get(
                     endpoint,
+                    params=params,
                     headers=self._get_headers(),
                 )
                 response.raise_for_status()
 
-                torrent_list = response.json().get("data", [])
+                data = response.json()
                 
-                for t in torrent_list:
-                    if t.get("hash", "").lower() == info_hash.lower():
-                        torrent_info = t
-                        break
-                        
-                if torrent_info:
-                    logger.info("torbox_dashboard_synced", info_hash=info_hash)
-                    return torrent_info
+                # Unwrap Torbox nested data structure
+                if isinstance(data, dict) and "data" in data:
+                    data = data["data"]
                     
+                cached = False
+                if isinstance(data, dict):
+                    # Check both lower and upper to be completely safe
+                    cached = info_hash.lower() in data or info_hash.upper() in data
+                    
+                if cached:
+                    logger.info("torbox_dashboard_synced", info_hash=info_hash)
+                    return {"hash": info_hash, "download_finished": True}
+                else:
+                    logger.debug("torbox_torrent_syncing_but_not_finished", info_hash=info_hash)
+                        
             except Exception as e:
                 logger.debug("torbox_sync_poll_error", error=str(e))
                 
-            logger.debug("torbox_torrent_not_yet_in_dashboard", info_hash=info_hash)
-            await asyncio.sleep(2.0)
+            logger.debug("torbox_torrent_not_yet_ready_in_dashboard", info_hash=info_hash)
             
         logger.error("torbox_torrent_not_in_dashboard_timeout", info_hash=info_hash)
         return None
@@ -173,7 +127,6 @@ class TorBoxClient:
         if not self.client:
             raise RuntimeError("Client not initialized")
 
-        # Check local cache to prevent spamming TorBox API for the same file
         cache_key = f"{info_hash}_{file_path}"
         if cache_key in self._link_cache:
             link, expiry = self._link_cache[cache_key]
@@ -183,34 +136,41 @@ class TorBoxClient:
         try:
             logger.info("torbox_direct_link_request", info_hash=info_hash, file_path=file_path)
 
-            # 1. Get your personal torrent list to find the torrent_id and file list
-            endpoint = "/api/torrents/mylist"
+            # 1. Get torrent_id (Idempotent, instant, guarantees it's in our dashboard)
+            torrent_id = await self.create_torrent(info_hash)
+            if not torrent_id:
+                logger.error("torbox_direct_link_failed_to_get_torrent_id", info_hash=info_hash)
+                return None
+
+            # 2. Get file list from checkcached (Ultra-fast, O(1), bypasses user cache)
+            endpoint = "/api/torrents/checkcached"
+            params = {"hash": info_hash, "format": "object", "list_files": "true", "bypass_cache": "true"}
+            
             response = await self.client.get(
                 endpoint,
+                params=params,
                 headers=self._get_headers(),
             )
             response.raise_for_status()
-            torrent_list = response.json().get("data", [])
             
-            torrent_info = None
-            for t in torrent_list:
-                if t.get("hash", "").lower() == info_hash.lower():
-                    torrent_info = t
-                    break
-                    
-            if not torrent_info:
-                logger.error("torbox_torrent_not_in_dashboard", info_hash=info_hash)
+            data = response.json()
+            if isinstance(data, dict) and "data" in data:
+                data = data["data"]
+                
+            # Handle both cases
+            torrent_data = data.get(info_hash.lower()) or data.get(info_hash.upper())
+            
+            if not torrent_data:
+                logger.error("torbox_torrent_not_in_checkcached", info_hash=info_hash)
                 return None
 
-            torrent_id = torrent_info.get("id")
-            files = torrent_info.get("files", [])
+            files = torrent_data.get("files", [])
 
-            # 3. Find the exact file_id by matching the qBittorrent file_path
+            # 3. Find the exact file_id
             file_id = None
             for f in files:
                 tb_name = f.get("name", "").replace("\\", "/")
                 req_name = file_path.replace("\\", "/")
-                # Substring match to handle folder structural differences
                 if tb_name in req_name or req_name in tb_name:
                     file_id = f.get("id")
                     break
@@ -219,7 +179,7 @@ class TorBoxClient:
                 logger.error("torbox_file_not_found_in_torrent", file_path=file_path)
                 return None
 
-            # 4. Request the direct download link (requires token in params)
+            # 4. Request the direct download link
             dl_endpoint = "/api/torrents/requestdl"
             dl_params = {
                 "token": self.api_key,
@@ -245,19 +205,3 @@ class TorBoxClient:
         except Exception as e:
             logger.error("torbox_direct_link_error", info_hash=info_hash, error=str(e))
             return None
-
-
-
-    def get_cached_link(self, info_hash: str) -> Optional[str]:
-        if info_hash in self._link_cache:
-            link, expiry = self._link_cache[info_hash]
-            if datetime.utcnow() < expiry:
-                return link
-            else:
-                del self._link_cache[info_hash]
-
-        return None
-
-    def clear_cache(self) -> None:
-        self._link_cache.clear()
-        logger.info("torbox_cache_cleared")

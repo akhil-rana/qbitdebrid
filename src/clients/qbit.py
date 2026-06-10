@@ -1,4 +1,3 @@
-from os import sync
 from typing import Optional
 import qbittorrentapi
 
@@ -61,6 +60,7 @@ class QBitController:
                     progress=float(t.get("progress", 0.0)),
                     total_size=int(t.get("total_size", 0)),
                     tags=t.get("tags", ""),
+                    comment=t.get("comment", ""),
                     save_path=t.get("save_path", "")
                 )
                 torrents.append(torrent_info)
@@ -92,40 +92,6 @@ class QBitController:
                 "qbit_get_files_failed", torrent_hash=torrent_hash, error=str(e)
             )
             raise
-
-    async def pause_torrent(self, torrent_hash: str) -> bool:
-        try:
-            self.client.torrents_pause(torrent_hashes=torrent_hash)
-            logger.info("qbit_torrent_paused", torrent_hash=torrent_hash)
-            return True
-        except Exception as e:
-            logger.error("qbit_pause_torrent_failed", error=str(e))
-            return False
-
-    async def resume_torrent(self, torrent_hash: str) -> bool:
-        try:
-            self.client.torrents_resume(torrent_hashes=torrent_hash)
-            logger.info("qbit_torrent_resumed", torrent_hash=torrent_hash)
-            return True
-        except Exception as e:
-            logger.error("qbit_resume_torrent_failed", error=str(e))
-            return False
-
-    async def add_web_seed(self, torrent_hash: str, web_seed_url: str) -> bool:
-        try:
-            # Use the correct python wrapper API method
-            if hasattr(self.client.torrents, "add_webseeds"):
-                self.client.torrents.add_webseeds(torrent_hash=torrent_hash, urls=web_seed_url)
-            else:
-                self.client.torrents_add_webseeds(torrent_hash, web_seed_url)
-                
-            logger.info("qbit_web_seed_added", torrent_hash=torrent_hash)
-            return True
-        except Exception as e:
-            logger.error(
-                "qbit_web_seed_failed", torrent_hash=torrent_hash, error=str(e)
-            )
-            return False
         
     async def set_sequential_download(
         self,
@@ -141,7 +107,15 @@ class QBitController:
             if current_state != enabled:
                 self.client.torrents_toggle_sequential_download(torrent_hashes=torrent_hash)
                 
-            logger.info("qbit_sequential_download_set", torrent_hash=torrent_hash)
+            # 3. Aggressively enable first/last piece priority as well for optimal streaming
+            f_l_prio = torrent.get("f_l_piece_prio", False)
+            if f_l_prio != enabled:
+                try:
+                    self.client.torrents_toggle_first_last_piece_prio(torrent_hashes=torrent_hash)
+                except Exception:
+                    pass # Older versions might not support this
+                
+            logger.info("qbit_sequential_download_set", torrent_hash=torrent_hash, seq_dl=enabled)
             return True
         except Exception as e:
             logger.error("qbit_sequential_download_failed", error=str(e))
@@ -179,14 +153,13 @@ class QBitController:
         max_connections: int = -1,
     ) -> bool:
         try:
-            # We explicitly set the download limit to unlimited just to make sure qbittorrent doesn't internally throttle
+            # Explicitly set unlimited download limit to prevent internal throttling
             self.client.torrents_set_download_limit(torrent_hashes=torrent_hash, limit=-1)
             
-            # We choke the upload limit to 1 KB/s to discourage P2P activity
+            # Choke upload limit to 1 KB/s to discourage P2P activity
             self.client.torrents_set_upload_limit(torrent_hashes=torrent_hash, limit=1024)
             
-            # We must set max connections to unlimited (-1) because web seeds consume concurrent connections. 
-            # If limited to 1, qbittorrent will NEVER download faster than 1 slow HTTP stream.
+            # Unlimited connections (-1) required for maximum web seed performance
             if hasattr(self.client, "torrents_edit"):
                 self.client.torrents_edit(torrent_hash=torrent_hash, max_connections=-1, max_uploads=0)
             
@@ -260,7 +233,7 @@ class QBitController:
             prefs = self.client.app.preferences
             current_banned_ips_str = prefs.get("banned_IPs", "")
             
-            # 2. Parse current banned IPs (newline separated)
+            # 2. Parse current banned IPs
             current_banned_ips = set(
                 ip.strip() for ip in current_banned_ips_str.split("\n") if ip.strip()
             )
@@ -284,14 +257,18 @@ class QBitController:
             logger.error("qbit_export_failed", torrent_hash=torrent_hash, error=str(e))
             return None
 
-    async def add_raw_torrent(self, torrent_data: bytes, save_path: str, tags: str) -> bool:
+    async def add_raw_torrent(self, torrent_data: bytes, save_path: str, tags: str, is_paused: bool = True, stop_condition: Optional[str] = None) -> bool:
         try:
-            self.client.torrents_add(
-                torrent_files=torrent_data,
-                save_path=save_path,
-                tags=tags,
-                is_paused=True
-            )
+            kwargs = {
+                "torrent_files": torrent_data,
+                "save_path": save_path,
+                "tags": tags,
+                "is_paused": is_paused,
+            }
+            if stop_condition:
+                kwargs["stop_condition"] = stop_condition
+                
+            self.client.torrents_add(**kwargs)
             return True
         except Exception as e:
             logger.error("qbit_add_raw_failed", error=str(e))
