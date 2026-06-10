@@ -26,10 +26,15 @@ class ProxyServer:
             # Startup
             yield
             # Shutdown
-            await self.streaming_service.close()
+            import asyncio
+            try:
+                await asyncio.wait_for(self.streaming_service.close(), timeout=3.0)
+            except asyncio.TimeoutError:
+                logger.warning("streaming_service_shutdown_timeout_forcing_exit")
+            except Exception as e:
+                logger.error("streaming_service_shutdown_error", error=str(e))
             
         self.app = FastAPI(lifespan=lifespan)
-        self._printed_urls = set()
         self._setup_routes()
 
     def _setup_routes(self):
@@ -41,7 +46,7 @@ class ProxyServer:
         ):
             try:
                 range_header = request.headers.get("range")
-                logger.info(
+                logger.debug(
                     "proxy_request",
                     info_hash=info_hash,
                     file_path=file_path,
@@ -55,12 +60,6 @@ class ProxyServer:
                     raise HTTPException(status_code=404, detail="Direct file link not found on TorBox")
 
                 file_url, true_file_size = file_info
-
-                if file_url not in self._printed_urls:
-                    encoded_file_path = quote(file_path)
-                    proxy_url = f"http://{request.client.host if request.client else '127.0.0.1'}:{self.settings.proxy_port}/proxy/{info_hash}/{encoded_file_path}"
-                    print(f"\n{'='*60}\nPROXY DOWNLOAD LINK (Paste in browser):\n{proxy_url}\n{'='*60}\n")
-                    self._printed_urls.add(file_url)
 
                 if not range_header:
                     if request.method == "HEAD":
@@ -79,14 +78,17 @@ class ProxyServer:
                     true_file_size,
                 )
 
+                response_headers = {
+                    k: v
+                    for k, v in headers.items()
+                    if k.lower() in ["content-type", "content-length", "content-range", "connection", "keep-alive"]
+                }
+                response_headers["Server"] = "qbitdebrid"
+
                 return StreamingResponse(
                     stream,
                     status_code=status,
-                    headers={
-                        k: v
-                        for k, v in headers.items()
-                        if k.lower() in ["content-type", "content-length", "content-range", "connection", "keep-alive"]
-                    },
+                    headers=response_headers,
                     media_type="application/octet-stream",
                 )
 

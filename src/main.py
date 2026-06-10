@@ -39,8 +39,7 @@ async def main():
     )
 
     if not await qbit.connect():
-        logger.error("failed_to_connect_qbittorrent")
-        return
+        logger.warning("failed_to_connect_qbittorrent_initial_startup_monitoring_in_background")
 
     async with TorBoxClient(settings.torbox_api_key) as torbox:
         daemon = AutomationDaemon(
@@ -56,11 +55,16 @@ async def main():
 
         daemon_task = asyncio.create_task(daemon.start())
 
+        is_debug = settings.log_level.upper() == "DEBUG"
+        
         config = uvicorn.Config(
             proxy.app,
             host=settings.proxy_host,
             port=settings.proxy_port,
             log_level=settings.log_level.lower(),
+            access_log=is_debug,
+            server_header=False,
+            timeout_grace_period=3,
         )
         server = uvicorn.Server(config)
 
@@ -77,9 +81,11 @@ async def main():
             await daemon.stop()
             daemon_task.cancel()
             try:
-                await daemon_task
-            except asyncio.CancelledError:
+                await asyncio.wait_for(daemon_task, timeout=2.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
                 pass
+            except Exception as e:
+                logger.error("daemon_shutdown_error", error=str(e))
 
 
 if __name__ == "__main__":

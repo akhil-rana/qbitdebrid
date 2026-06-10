@@ -28,13 +28,16 @@ class QBitController:
             password=password,
         )
         self._tracked_hashes: set[str] = set()
+        self._was_connected: bool = True
 
     async def connect(self) -> bool:
         try:
             self.client.auth_log_in()
+            self._was_connected = True
             logger.info("qbit_connected", host=self.host, port=self.port)
             return True
         except Exception as e:
+            self._was_connected = False
             logger.error("qbit_connection_failed", host=self.host, error=str(e))
             return False
 
@@ -65,9 +68,25 @@ class QBitController:
                 )
                 torrents.append(torrent_info)
 
+            if not self._was_connected:
+                self._was_connected = True
+                logger.info("qbit_reconnected_successfully")
+
             return torrents
         except Exception as e:
-            logger.error("qbit_get_torrents_failed", error=str(e))
+            if self._was_connected:
+                logger.warning("qbit_connection_lost", error=str(e))
+                self._was_connected = False
+            else:
+                logger.debug("qbit_waiting_for_connection", error=str(e))
+            
+            try:
+                self.client.auth_log_in()
+                if not self._was_connected:
+                    self._was_connected = True
+                    logger.info("qbit_reconnected_successfully")
+            except Exception:
+                pass
             raise
 
     async def get_torrent_files(self, torrent_hash: str) -> list[FileInfo]:
@@ -115,7 +134,7 @@ class QBitController:
                 except Exception:
                     pass # Older versions might not support this
                 
-            logger.info("qbit_sequential_download_set", torrent_hash=torrent_hash, seq_dl=enabled)
+            logger.debug("qbit_sequential_download_set", torrent_hash=torrent_hash, seq_dl=enabled)
             return True
         except Exception as e:
             logger.error("qbit_sequential_download_failed", error=str(e))
@@ -141,7 +160,7 @@ class QBitController:
             except Exception:
                 pass
 
-            logger.info("qbit_trackers_removed", torrent_hash=torrent_hash)
+            logger.debug("qbit_trackers_removed", torrent_hash=torrent_hash)
             return True
         except Exception as e:
             logger.error("qbit_remove_trackers_failed", error=str(e))
@@ -180,76 +199,12 @@ class QBitController:
             except Exception:
                 pass
 
-            logger.info("qbit_p2p_throttled", torrent_hash=torrent_hash)
+            logger.debug("qbit_p2p_throttled", torrent_hash=torrent_hash)
             return True
         except Exception as e:
             logger.error("qbit_max_connections_failed", error=str(e))
             return False
 
-    async def get_torrent_peers(self, torrent_hash: str) -> list[str]:
-        try:
-            # Sync torrentPeers returns a dict of peers where keys are IP:PORT
-            if hasattr(self.client.sync, "torrent_peers"):
-                sync_data = self.client.sync.torrent_peers(torrent_hash=torrent_hash)
-            else:
-                sync_data = self.client.sync_torrent_peers(torrent_hash=torrent_hash)
-                
-            peers = sync_data.get("peers", {})
-            return list(peers.keys())
-        except Exception as e:
-            logger.debug("qbit_get_peers_failed", torrent_hash=torrent_hash, error=str(e))
-            return []
-
-    async def ban_peers(self, peers: list[str]) -> bool:
-        if not peers:
-            return True
-            
-        try:
-            peer_str = "|".join(peers)
-            if hasattr(self.client.transfer, "ban_peers"):
-                self.client.transfer.ban_peers(peers=peer_str)
-            else:
-                # Fallback to direct API call if wrapper doesn't support it
-                self.client._http.post("transfer/banPeers", data={"peers": peer_str})
-                
-            logger.info("qbit_peers_banned", count=len(peers))
-            return True
-        except Exception as e:
-            logger.error("qbit_ban_peers_failed", error=str(e))
-            return False
-    async def unban_peers(self, peers: set[str]) -> bool:
-        """Unbans peers by removing their IPs from the global banned_IPs preference list."""
-        if not peers:
-            return True
-            
-        try:
-            # Extract just the IPs from the host:port peer strings
-            ips_to_unban = set()
-            for peer in peers:
-                ip = peer.split(":")[0] if ":" in peer else peer
-                ips_to_unban.add(ip.strip())
-
-            # 1. Get current preferences
-            prefs = self.client.app.preferences
-            current_banned_ips_str = prefs.get("banned_IPs", "")
-            
-            # 2. Parse current banned IPs
-            current_banned_ips = set(
-                ip.strip() for ip in current_banned_ips_str.split("\n") if ip.strip()
-            )
-            
-            # 3. Remove the IPs we want to unban
-            new_banned_ips = current_banned_ips - ips_to_unban
-            
-            # 4. Set the new preferences
-            new_banned_ips_str = "\n".join(new_banned_ips)
-            self.client.app_set_preferences(prefs={"banned_IPs": new_banned_ips_str})
-            
-            logger.info("qbit_peers_unbanned", count=len(ips_to_unban))
-            return True
-        except Exception as e:
-            logger.error("qbit_unban_peers_failed", error=str(e))
-            return False
     async def export_torrent(self, torrent_hash: str) -> Optional[bytes]:
         try:
             return self.client.torrents_export(torrent_hash=torrent_hash)
@@ -290,7 +245,7 @@ class QBitController:
             for file_idx, priority in file_priorities.items():
                 self.client.torrents.file_priority(torrent_hash, file_idx, priority)
 
-            logger.info("qbit_file_priority_set", torrent_hash=torrent_hash)
+            logger.debug("qbit_file_priority_set", torrent_hash=torrent_hash)
             return True
         except Exception as e:
             logger.error("qbit_file_priority_failed", error=str(e))

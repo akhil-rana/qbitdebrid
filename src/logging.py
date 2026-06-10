@@ -4,10 +4,31 @@ from typing import Any
 
 
 def configure_logging(log_level: str = "INFO", log_format: str = "json") -> None:
+    target_level = getattr(logging, log_level.upper())
+    
     logging.basicConfig(
         format="%(message)s",
-        level=getattr(logging, log_level.upper()),
+        level=target_level,
     )
+    
+    if target_level > logging.DEBUG:
+        # Suppress verbose third-party loggers that bypass structlog in standard operation
+        logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+        logging.getLogger("qbittorrentapi").setLevel(logging.CRITICAL)
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+        logging.getLogger("aiohttp").setLevel(logging.WARNING)
+        logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+        logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    else:
+        # In DEBUG mode, explicitly allow all raw third-party text logs to bleed through for deep tracing
+        logging.getLogger("urllib3").setLevel(logging.DEBUG)
+        logging.getLogger("qbittorrentapi").setLevel(logging.DEBUG)
+        logging.getLogger("httpx").setLevel(logging.DEBUG)
+        logging.getLogger("httpcore").setLevel(logging.DEBUG)
+        logging.getLogger("aiohttp").setLevel(logging.DEBUG)
+        logging.getLogger("uvicorn.error").setLevel(logging.DEBUG)
+        logging.getLogger("uvicorn.access").setLevel(logging.DEBUG)
 
     structlog.configure(
         processors=[

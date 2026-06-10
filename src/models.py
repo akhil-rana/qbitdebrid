@@ -33,7 +33,6 @@ class TorrentInfo:
     progress: float
     total_size: int
     isolation_applied: bool = False
-    banned_peers: set[str] = field(default_factory=set)
     tags: str = ""
     comment: str = ""
     save_path: str = ""

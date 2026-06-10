@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     torrent_process_tag: str = ""
 
     log_level: str = "INFO"
-    log_format: str = "json"
+    log_format: str = "console"
 
     class Config:
         env_file = ".env"

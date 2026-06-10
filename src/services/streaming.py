@@ -73,11 +73,11 @@ class StreamingService:
 
     async def _cleanup_loop(self):
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(5)
             now = time.time()
             to_delete = []
             for stream_id, stream in self._active_streams.items():
-                if now - stream.last_accessed > 60:  # Terminate idle streams after 60s
+                if now - stream.last_accessed > 10:  # Terminate idle streams after 10s to free RAM aggressively
                     stream.worker_task.cancel()
                     to_delete.append(stream_id)
             for sid in to_delete:
@@ -85,7 +85,7 @@ class StreamingService:
 
     async def _prefetch_worker(self, stream_id: str, url: str, headers: dict, queue: asyncio.Queue, stream: ActiveStream, file_size: int):
         """Downloads continuously from the provider and pushes chunks into the bounded memory queue."""
-        logger.info("prefetch_worker_starting", stream_id=stream_id, range=headers.get("Range"))
+        logger.debug("prefetch_worker_starting", stream_id=stream_id, range=headers.get("Range"))
             
         current_offset = stream.start_byte
         # Enforce a strict 15-second read timeout. If Cloudflare stalls without closing the TCP socket,
@@ -109,8 +109,15 @@ class StreamingService:
                                 return
 
                             while not resp.content.at_eof() and not self.session.closed:
-                                chunk = await resp.content.read(self.chunk_size)
-                                if chunk:
+                                buffer = bytearray()
+                                while len(buffer) < self.chunk_size and not resp.content.at_eof() and not self.session.closed:
+                                    data = await resp.content.read(self.chunk_size - len(buffer))
+                                    if not data:
+                                        break
+                                    buffer.extend(data)
+                                    
+                                if buffer:
+                                    chunk = bytes(buffer)
                                     await queue.put(chunk)
                                     current_offset += len(chunk)
                                 else:
@@ -135,7 +142,7 @@ class StreamingService:
         finally:
             stream.is_eof = True
             await queue.put(None) # Signal EOF to client
-            logger.info("prefetch_worker_finished", stream_id=stream_id)
+            logger.debug("prefetch_worker_finished", stream_id=stream_id)
 
     async def stream_range(
         self,
@@ -174,13 +181,16 @@ class StreamingService:
             stream = self._active_streams[stream_id]
             stream.last_accessed = time.time()
             stream.total_requested_length = content_length
-            logger.info("resuming_active_stream", stream_id=stream_id)
+            logger.debug("resuming_active_stream", stream_id=stream_id)
         else:
             # 4. Create a new prefetch worker
             prefetch_headers = headers.copy()
             prefetch_headers["Range"] = f"bytes={req_start}-"
             
-            max_queue_chunks = max(4, (self.prefetch_mb * 1024 * 1024) // self.chunk_size)
+            # Enforce a strict global RAM limit by dynamically splitting the buffer across all active HTTP streams
+            active_stream_count = len(self._active_streams) + 1
+            dynamic_prefetch_bytes = (self.prefetch_mb * 1024 * 1024) // active_stream_count
+            max_queue_chunks = max(2, dynamic_prefetch_bytes // self.chunk_size)
             
             queue = asyncio.Queue(maxsize=max_queue_chunks)
             stream = ActiveStream(

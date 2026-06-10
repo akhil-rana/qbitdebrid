@@ -44,7 +44,7 @@ class TorBoxClient:
             return self._torrent_ids[info_hash]
 
         try:
-            logger.info("torbox_creating_torrent", info_hash=info_hash)
+            logger.debug("torbox_creating_torrent", info_hash=info_hash)
             endpoint = "/api/torrents/createtorrent"
             
             data = {
@@ -88,7 +88,7 @@ class TorBoxClient:
         if not self.client:
             raise RuntimeError("Client not initialized")
             
-        logger.info("torbox_waiting_for_dashboard_sync", info_hash=info_hash)
+        logger.debug("torbox_waiting_for_dashboard_sync", info_hash=info_hash)
         
         # Strategy: 0s, 5s, 30s, then every 10s up to 1 hour
         # 1 hour = 3600 seconds. Total wait so far: 0 + 5 + 30 = 35s.
@@ -174,7 +174,7 @@ class TorBoxClient:
                 return link, size
 
         try:
-            logger.info("torbox_direct_link_request", info_hash=info_hash, file_path=file_path)
+            logger.debug("torbox_direct_link_request", info_hash=info_hash, file_path=file_path)
 
             # 1. Get torrent_id from memory cache
             torrent_id = self._torrent_ids.get(info_hash)
@@ -250,7 +250,7 @@ class TorBoxClient:
             
             if link:
                 self._link_cache[cache_key] = (link, true_file_size, datetime.utcnow() + self._cache_ttl)
-                logger.info("torbox_direct_link_obtained", file_path=file_path)
+                logger.debug("torbox_direct_link_obtained", file_path=file_path)
 
             return link, true_file_size
 

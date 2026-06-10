@@ -46,12 +46,6 @@ class AutomationDaemon:
             logger.info("daemon_cancelled")
         finally:
             self._running = False
-            
-            # Unban any peers we temporarily banned during this session
-            for torrent in self._known_torrents.values():
-                if torrent.banned_peers:
-                    await self.qbit_controller.unban_peers(torrent.banned_peers)
-                    
             logger.info("daemon_stopped")
 
     async def stop(self) -> None:
@@ -73,12 +67,9 @@ class AutomationDaemon:
                     )
                     if torrent:
                         await self._process_new_torrent(torrent)
-                
-            # Actively monitor and ban rogue P2P peers
-            await self._monitor_peers(current_torrents)
 
         except Exception as e:
-            logger.error("poll_torrents_error", error=str(e))
+            logger.debug("poll_torrents_error", error=str(e))
 
     async def _process_new_torrent(self, torrent: TorrentInfo) -> None:
         # Filter by tag if configured
@@ -91,7 +82,7 @@ class AutomationDaemon:
                 logger.debug("ignoring_torrent_due_to_missing_tag", name=torrent.name, required_tag=self.process_tag)
                 return
 
-        logger.info("processing_new_torrent", name=torrent.name)
+        logger.debug("processing_new_torrent", name=torrent.name)
 
         try:
             # Check if this is an already mutated torrent by looking for our signature in the comment
@@ -132,12 +123,12 @@ class AutomationDaemon:
                     return
                     
                 torrent.info_hash = original_hash
-                logger.info("detected_mutated_torrent", name=torrent.name, original_hash=original_hash)
+                logger.debug("detected_mutated_torrent", name=torrent.name, original_hash=original_hash)
                 
                 # Restore original file selection/priorities if they were saved
                 if prios:
                     await self.qbit_controller.set_file_priority(torrent.hash, prios)
-                    logger.info("restored_file_priorities", name=torrent.name)
+                    logger.debug("restored_file_priorities", name=torrent.name)
                     
                 # Apply isolation protocol (which enables sequential download and removes trackers)
                 await self._apply_isolation_protocol(torrent)
@@ -240,7 +231,7 @@ class AutomationDaemon:
             logger.error("background_mutate_error", name=torrent.name, error=str(e))
 
     async def _apply_isolation_protocol(self, torrent: TorrentInfo) -> None:
-        logger.info("applying_isolation_protocol", name=torrent.name)
+        logger.debug("applying_isolation_protocol", name=torrent.name)
 
         try:
             # Enforce sequential download for HTTP stream optimization
@@ -261,26 +252,3 @@ class AutomationDaemon:
 
         except Exception as e:
             logger.error("apply_isolation_error", name=torrent.name, error=str(e))
-
-    async def _monitor_peers(self, current_torrents: list[TorrentInfo]) -> None:
-        """Actively scans for rogue P2P peers and bans them to prioritize the web seed."""
-        for torrent in current_torrents:
-            if not torrent.isolation_applied:
-                continue
-
-            try:
-                active_peers = await self.qbit_controller.get_torrent_peers(torrent.hash)
-                rogue_peers = []
-                
-                for peer in active_peers:
-                    # Ignore the web seed itself, but ban all actual P2P peers
-                    if "127.0.0.1" not in peer and "localhost" not in peer:
-                        rogue_peers.append(peer)
-                        torrent.banned_peers.add(peer)
-
-                if rogue_peers:
-                    await self.qbit_controller.ban_peers(rogue_peers)
-                    logger.info("rogue_peers_banned", torrent_hash=torrent.hash, count=len(rogue_peers))
-                    
-            except Exception as e:
-                logger.debug("monitor_peers_error", error=str(e))
