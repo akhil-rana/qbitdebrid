@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     qbit_poll_interval: int = 3
 
     proxy_host: str = "127.0.0.1"
-    proxy_port: int = 8888
+    proxy_port: int = 8593
     proxy_max_connections: int = 16
     proxy_chunk_size: int = 4194304
     proxy_prefetch_buffer_mb: int = 512
@@ -37,7 +37,7 @@ def get_settings() -> Settings:
     for var in ["PROXY_CHUNK_SIZE", "PROXY_MAX_CONNECTIONS", "PROXY_PREFETCH_BUFFER_MB", "PROXY_HOST", "PROXY_PORT"]:
         if var in os.environ:
             overrides.append(f"{var}={os.environ[var]}")
-    if overrides:
+    if overrides and os.path.exists(".env"):
         print(f"\n\033[93m[WARNING] Terminal environment variables are OVERRIDING your .env file:\033[0m")
         print(f"  -> \033[91m{', '.join(overrides)}\033[0m")
         print(f"  -> To fix and use your .env file values, run this command in your terminal:")

@@ -1,0 +1,22 @@
+services:
+  qbitdebrid:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: qbitdebrid
+    restart: unless-stopped
+    ports:
+      - "8593:8593"
+    env_file:
+      - .env
+    environment:
+      # Force host interface inside container to bind to 0.0.0.0 so it is routable
+      - PROXY_HOST=0.0.0.0
+      # Ensure logs are formatted as JSON inside Docker for optimal log engine ingestion
+      - LOG_FORMAT=json
+    # Cap memory and CPU usage to keep the proxy lightweight
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 1G

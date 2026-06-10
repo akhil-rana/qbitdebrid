@@ -38,6 +38,10 @@ class ProxyServer:
         self._setup_routes()
 
     def _setup_routes(self):
+        @self.app.get("/health")
+        async def health_check():
+            return {"status": "ok"}
+
         @self.app.api_route("/proxy/{info_hash}/{file_path:path}", methods=["GET", "HEAD"])
         async def stream_file(
             info_hash: str,
