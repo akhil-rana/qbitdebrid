@@ -1,13 +1,18 @@
 # ==============================================================================
 # Stage 1: Build stage
 # ==============================================================================
-FROM python:3.12-slim AS builder
+FROM python:3.14-slim AS builder
 
 WORKDIR /build
 
 # Prevent Python from writing pyc files to disk and enable unbuffered logging
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+
+# Install system build dependencies for compilation on architectures without wheels
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gcc build-essential python3-dev && \
+    rm -rf /var/lib/apt/lists/*
 
 # Copy requirements file first to utilize Docker build layer caching
 COPY requirements.txt .
@@ -18,7 +23,7 @@ RUN pip install --no-cache-dir --user -r requirements.txt
 # ==============================================================================
 # Stage 2: Final ultra-lean runtime stage
 # ==============================================================================
-FROM python:3.12-slim AS runner
+FROM python:3.14-slim AS runner
 
 WORKDIR /app
 

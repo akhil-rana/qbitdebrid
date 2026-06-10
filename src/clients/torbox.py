@@ -1,6 +1,6 @@
 import httpx
 import asyncio
-from typing import Optional
+from typing import Optional, Tuple
 from datetime import datetime, timedelta
 
 from qbitdebrid.logging import get_logger

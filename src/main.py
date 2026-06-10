@@ -64,7 +64,7 @@ async def main():
             log_level=settings.log_level.lower(),
             access_log=is_debug,
             server_header=False,
-            timeout_grace_period=3,
+            timeout_graceful_shutdown=3,
         )
         server = uvicorn.Server(config)
 
